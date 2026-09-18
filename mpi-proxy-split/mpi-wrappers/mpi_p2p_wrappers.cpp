@@ -35,6 +35,8 @@
 #include "record-replay.h"
 // To support MANA_P2P_LOG and MANA_P2P_REPLAY:
 #include "p2p-deterministic.h"
+// Send implementation for host-side CUDA MPI.
+#include "mana_cuda.h"
 
 extern int p2p_deterministic_skip_save_request;
 
@@ -52,9 +54,20 @@ int PMPI_Send(const void *buf, int count, MPI_Datatype datatype,
   local_sent_messages++;
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
   MPI_Datatype realType = get_real_id((mana_mpi_handle){.datatype = datatype}).datatype;
+  // If handling CUDA device pointer, copy buffer to upper half and pass that instead.
+  void* transfer_buf = NULL;
+  if (mana_cuda_is_dev_ptr(buf)) {
+	  int tsize;
+	  MPI_Type_size(datatype, &tsize);
+	  size_t nbytes = ((size_t) count * tsize);
+	  transfer_buf = malloc(nbytes);
+	  cudaMemcpy(transfer_buf, buf, nbytes, cudaMemcpyDeviceToHost);
+	  buf = transfer_buf;
+  }
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Send)(buf, count, realType, dest, tag, realComm);
   RETURN_TO_UPPER_HALF();
+  free(transfer_buf); // can safely free, as MPI_Send is blocking.
   DMTCP_PLUGIN_ENABLE_CKPT();
 #ifdef DEBUG_P2P
   if (retval == MPI_SUCCESS) {
