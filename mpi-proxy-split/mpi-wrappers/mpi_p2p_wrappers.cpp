@@ -190,6 +190,9 @@ int PMPI_Recv(void *buf, int count, MPI_Datatype datatype,
 
   int retval = MPI_SUCCESS;
   int flag = 0;
+  void* dev_ptr = NULL;
+  void* stage_buf = NULL;
+  size_t stage_bytes = 0;
 
 retry:
   // Step 1: serve from the MANA-internal buffer if a matching message
@@ -199,8 +202,16 @@ retry:
     int type_size;
     MPI_Type_size(datatype, &type_size);
     int msg_size = type_size * count;
-    consumeMatchingMsgBuffer(buf, count, datatype, source, tag, comm,
+    if (mana_cuda_is_dev_ptr(buf)) {
+			void* tmp = malloc(msg_size);
+			consumeMatchingMsgBuffer(tmp, count, datatype, source, tag, comm,
+			status, msg_size);
+			cudaMemcpy(buf, tmp, msg_size, cudaMemcpyHostToDevice);
+			free(tmp);
+		} else {
+			consumeMatchingMsgBuffer(buf, count, datatype, source, tag, comm,
                              status, msg_size);
+    }
     local_recv_messages++;
     return MPI_SUCCESS;
   }
@@ -226,6 +237,14 @@ retry:
   MPI_Status local_status;
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
   MPI_Datatype realType = get_real_id((mana_mpi_handle){.datatype = datatype}).datatype;
+	if (mana_cuda_is_dev_ptr(buf)) {
+		int type_size;
+	  MPI_Type_size(datatype, &type_size);
+ 		stage_bytes = ((size_t) type_size * count);
+		stage_buf = malloc(stage_bytes);
+		dev_ptr = buf;
+		buf = stage_buf;
+	}		
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Recv)(buf, count, realType, source, tag, realComm,
                            &local_status);
@@ -233,6 +252,15 @@ retry:
 
   // Step 4: classify as real or dummy.
   if (p2p_dummy_phase) {
+		// Case where handling device pointer.
+		// Reset buf to be a device buf to be properly retried on check, 
+		// and free the stage buffer and device buffer.
+		if (dev_ptr != NULL) {
+			free(stage_buf);
+			buf = dev_ptr;
+			dev_ptr = stage_buf = NULL;
+			stage_bytes = 0;
+		}
     // Dummy.  buf and local_status contain unusable data; discard.
     // Do NOT increment local_recv_messages (the dummy bypassed the
     // MPI_Send wrapper on the sender, so global counters stay balanced
@@ -253,6 +281,16 @@ retry:
   // Real message.
   local_recv_messages++;
   g_pending_recv.active = false;
+	if (dev_ptr != NULL) {
+		int receive_count = 0, type_size = 0;
+		MPI_Get_count(&local_status, datatype, &receive_count);
+		MPI_Type_size(datatype, &type_size);
+		size_t dev_count = (receive_count == MPI_UNDEFINED)
+				? stage_bytes
+				: ((size_t) receive_count * type_size);
+		cudaMemcpy(dev_ptr, stage_buf, dev_count, cudaMemcpyHostToDevice);
+		free(stage_buf);
+	}
   if (status != MPI_STATUS_IGNORE) {
     *status = local_status;
   }

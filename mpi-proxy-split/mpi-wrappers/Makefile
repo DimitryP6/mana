@@ -11,14 +11,14 @@ LOWER_HALF_SRCDIR=../lower-half
 PLUGIN_HALF_SRCDIR=..
 
 # As you add new files to your plugin library, add the object file names here.
-LIBWRAPPER_OBJS = mpi_p2p_wrappers.o mpi_collective_wrappers.o \
+LIBWRAPPER_OBJS = mana_cuda.o mpi_p2p_wrappers.o mpi_collective_wrappers.o \
                   mpi_request_wrappers.o mpi_type_wrappers.o \
                   mpi_comm_wrappers.o mpi_group_wrappers.o \
                   mpi_cart_wrappers.o mpi_op_wrappers.o \
                   mpi_unimplemented_wrappers.o mpi_fortran_wrappers.o \
                   mpi_wrappers.o get_fortran_constants.o fortran_constants.o \
                   mpi_win_wrappers.o mpi_file_wrappers.o mpi_error_wrappers.o \
-                  p2p-deterministic.o
+                  p2p-deterministic.o 
 
 
 # Modify if your MANA_ROOT is located elsewhere.
@@ -37,7 +37,7 @@ override CFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${PLUGIN_HALF_SRCDIR} \
 	                 -I${LOWER_HALF_SRCDIR}
 override CXXFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${JALIB_INCLUDE} \
                      -I${PLUGIN_HALF_SRCDIR} -I${DMTCP_ROOT}/src \
-                     -I${LOWER_HALF_SRCDIR}
+                     -I${LOWER_HALF_SRCDIR} -I/usr/local/cuda/include
 
 # We don't build libmpiwrappers.a.  Instead, we use *.o to build libmana.so.
 default: ${LIBNAME}.a libmpistub.so

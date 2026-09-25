@@ -1,3 +1,6 @@
+#include <cuda_runtime.h>
+
+
 #ifndef MANA_CUDA
 #define MANA_CUDA
 
