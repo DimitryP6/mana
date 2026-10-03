@@ -51,6 +51,7 @@
 #include "virtual_id.h"
 #include "uh_wrappers.h"
 #include "logging.h"
+#include "mpi-wrappers/mana_cuda_table.h"
 
 #include "config.h"
 #include "dmtcp.h"
