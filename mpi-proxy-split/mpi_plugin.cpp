@@ -966,6 +966,10 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       initialize_wrappers();
       lh_info->uh_stack_start = uh_stack_start;
       lh_info->uh_stack_end = uh_stack_end;
+      if (upper_half_init_cuda_table() != 0) {
+	  fprintf(stderr, "CUDA table setup failed.\n");
+      }
+      
       printEventToStderr("EVENT_RESTART");
       processingOpenCkpFileFds = false;
       logCkptFileFds();

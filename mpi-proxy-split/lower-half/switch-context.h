@@ -73,12 +73,24 @@ class SwitchContext
 // the lower half.
 #define JUMP_TO_LOWER_HALF(lhFs) \
   do { \
+    lh_info->uh_fs = ((void*)getFS()); \
     SwitchContext ctx((unsigned long)lhFs)
 
 // Helper macro to be used whenever making a returning from the lower half to
 // the upper half.
 #define RETURN_TO_UPPER_HALF() \
   } while (0)
+
+// Helper macro to be used whenever making a jump from the lower half to
+// the upper half.
+#define JUMP_TO_UPPER_HALF(uhFs) \
+	do { \
+		SwitchContext ctx((unsigned long)uhFs)
+
+// Helper macro to be used whenever making a returning from the upper half to
+// the lower half.
+#define RETURN_TO_LOWER_HALF() \
+	} while (0)
 
 #define ONEMB (uint64_t)(1024 * 1024)
 #define ONEGB (uint64_t)(1024 * 1024 * 1024)

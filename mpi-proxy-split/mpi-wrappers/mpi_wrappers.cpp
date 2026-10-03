@@ -35,6 +35,7 @@
 #include "mana_header.h"
 #include "seq_num.h"
 #include "uh_wrappers.h"
+#include "mana_cuda_table.h"
 
 using namespace dmtcp_mpi;
 bool g_libmpi_is_initialized = false;
@@ -56,6 +57,9 @@ extern "C" {
 
 #pragma weak MPI_Init = PMPI_Init
 int PMPI_Init(int *argc, char ***argv) {
+  if (upper_half_init_cuda_table() != 0) {
+	  fprintf(stderr, "CUDA table setup failed.\n");
+  }
   int retval;
   if (isUsingCollectiveToP2p()) {
     fprintf(stderr, collective_p2p_string);
@@ -87,6 +91,9 @@ int PMPI_Init(int *argc, char ***argv) {
 
 #pragma weak MPI_Init_thread = PMPI_Init_thread
 int PMPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
+  if (upper_half_init_cuda_table() != 0) {
+	  fprintf(stderr, "CUDA table setup failed.\n");
+  }
   if (*provided == MPI_THREAD_MULTIPLE) {
     fprintf(stderr, "WARNING: MANA does not support MPI_THREAD_MULTIPLE.\n"); 
     fprintf(stderr, "MANA initialized with MPI_THREAD_SINGLE instead.\n"); 
