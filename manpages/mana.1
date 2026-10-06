@@ -70,10 +70,11 @@ A typical workflow for using MANA after untar\[aq]ing is:
 cd dmtcp-mana
 \&./configure --enable-debug
 make -j mana
-# Compile against libmana.so: Examples at contrib/mpi-proxy-split/test
+# Build the program with mpicc as usual; no relinking for MANA is needed.
+# 'make' also builds an example: mpi-proxy-split/examples/ring
 salloc -N 2 -q interactive -C haswell -t 01:00:00
 bin/mana_coordinator -i10
-srun -N 2 bin/mana_launch <TARGET_DIR>/ping_pong.mana.exe
+srun -N 2 bin/mana_launch mpi-proxy-split/examples/ring
 bin/mana_coordinator -i10
 srun -N 2 bin/mana_restart
 \f[R]
@@ -92,9 +93,32 @@ distinct checkpoint filenames
 The default is to overwrite the last checkpoint.
 .SH ENVIRONMENT VARIABLES AND DEBUGGING
 .TP
+\f[B]\f[R]\f[C]MANA_P2P_WAIT\f[R]\f[B]\f[R]
+How \f[C]MPI_Send\f[R] and \f[C]MPI_Recv\f[R] wait for their message.
+\f[C]polling\f[R] (the default): as \f[C]MPI_Isend\f[R] or
+\f[C]MPI_Irecv\f[R], then a loop of \f[C]MPI_Test\f[R] in MANA.
+\f[C]blocking\f[R]: in the MPI library\[cq]s own \f[C]MPI_Send\f[R] and
+\f[C]MPI_Recv\f[R].
+Both modes checkpoint and restart the same way.
+\f[C]polling\f[R] can be faster when the MPI library\[cq]s blocking wait
+yields the processor (MPICH 5).
+\f[C]blocking\f[R] is faster on Cray MPICH, and much faster when two
+ranks share a core.
+In \f[C]blocking\f[R] mode, MANA initializes the MPI library with
+\f[C]MPI_THREAD_MULTIPLE\f[R]; with a library that does not provide it,
+\f[C]blocking\f[R] can fail at a checkpoint (e.g., over UCX).
+MANA reads the variable at \f[C]MPI_Init\f[R] and keeps the mode after
+restart.
+.TP
 \f[B]\f[R]\f[C]MANA_DEBUG\f[R]\f[B]\f[R]
 MANA will print to stderr extra information to help developers debug
 MANA.
+.TP
+\f[B]\f[R]\f[C]MANA_PRELOAD\f[R]\f[B]\f[R]
+A colon-separated list of libraries that \f[C]mana_launch\f[R] loads
+ahead of MANA, so that they intercept MPI calls before MANA does (e.g.,
+a PMPI profiler).
+A library in \f[C]LD_PRELOAD\f[R] loads after them.
 .TP
 \f[B]\f[R]\f[C]DMTCP_MANA_PAUSE\f[R]\f[B] or \f[R]\f[C]DMTCP_LAUNCH_PAUSE\f[R]\f[B]\f[R]
 DMTCP/MANA will pause during launch to allow \f[C]gdb attach\f[R] (GDB
@@ -125,35 +149,6 @@ MPI_Send/Recv by copying MPI wrappers from mpi_collective_p2p.c to
 mpi_collective_wrappers.cpp in the mpi-wrappers subdirectory; or block
 certain translations by adjusting
 \f[C]#ifdef/#ifndef MPI_COLLECTIVE_P2P\f[R] in those files.
-.TP
-\f[B]\f[R]\f[C]MANA_P2P_LOG\f[R]\f[B]\[dq]\f[R]
-For debugging: Set this before mana_launch in order to log the order of
-point-to-point calls (MPI_Send and family) for later deterministic
-replay.
-See details at top of
-\f[C]mpi-proxy-split/mpi-wrappers/p2p-deterministic.c\f[R].
-.PP
-(IMPORTANT: If you checkpoint, continue running for a few minutes after
-that, for final updating of the log files.)
-.TP
-\f[B]\f[R]\f[C]MANA_P2P_REPLAY\f[R]\f[B]\f[R]
-For debugging: If a checkpoint was created with \f[C]MANA_P2P_LOG\f[R],
-then execute \f[C]mana_p2p_update_logs\f[R] and set this variable before
-\f[C]mana_restart\f[R].
-(Currently, you need to set this before \f[C]mana_launch\f[R], but this
-may be fixed later.)
-.PP
-\f[B]\f[CB]MANA_USE_ALLREDUCE_REPRODUCIBLE\f[B]\f[R]
-.PP
-When MPI_Allreduce specifies an associative/commutative operation, the
-MPI library must choose an ordering of the operation during reduce.
-The ordering may vary when calling MPI_Allreqduce after launch or after
-replay.
-By setting the environment variable MANA_USE_ALLREDUCE_REPRODUCIBLE at
-the time of launch, you can direct MANA to call the operations in a
-deterministic order, so that the output after checkpoint-restart will
-produce the same output as running after launch with no
-checkpoint-restart.
 .PP
 \f[B]\f[CB]INSPECTING MANA for DEBUGGING\f[B]\f[R]
 .PP

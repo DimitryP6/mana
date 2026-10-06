@@ -25,7 +25,9 @@
 #include <errno.h>
 #include <stddef.h>
 #include <assert.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -54,9 +56,11 @@ static char *arena_base = NULL;
 
 static void* __mmap_wrapper(void * , size_t , int , int , int , off_t);
 static void patchLibc(int , char * , char *);
+static void uhExit(int status);
 static void addRegionTommaps(char *, size_t);
 static int __munmap_wrapper(void *, size_t);
 static void updateMmaps(char *, size_t);
+static void patchSbrk(char *, char *, size_t);
 
 off_t get_symbol_offset(const char *pathame, const char *symbol);
 
@@ -220,6 +224,15 @@ void init_mem_arena(char *base)
   free_blocks.push_back({arena_base, SIZE_MAX / 2});
 }
 
+// At restart, after restore_mmap() has mapped the upper half's areas, the
+// upper half's new areas go above them.  Without an arena, they would go
+// where the kernel puts them, among the lower half's mappings, and a later
+// restart's lower half may already have mapped that address.
+void init_mem_arena_after_restore()
+{
+  init_mem_arena((char*)ROUND_UP(max_allocated_addr, PAGE_SIZE));
+}
+
 // Returns a pointer to the array of mmap-ed regions
 // Sets num to the number of valid items in the array
 std::vector<MmapInfo_t> &get_mmapped_list(int *num) {
@@ -255,6 +268,101 @@ void block_if_contains(void *target, void *addr, size_t length) {
     volatile int dummy = 1;
     while (dummy);
   }
+}
+
+// The upper half's heap.  The kernel's brk belongs to the lower half
+// (create_heap_guard_page()), and glibc's mmap'ed fallback arena never gives
+// memory back to the kernel, which is slow.  So the upper half's libc sbrk()
+// jumps to uhSbrk(), which moves a break of its own in a reserved region.
+// Other callers of sbrk() (DMTCP, MANA, the application) still see the
+// kernel's break: DMTCP places and restores memory around it.
+#define UH_BRK_RESERVE (1UL << 36)  // 64 GB of address space
+
+// In the reserved region's first page, so that it is checkpointed and
+// restored with the upper half.
+typedef struct {
+  char *brk;
+  char *base;            // [base, end): the heap's pages
+  char *end;
+  char *libc_text;       // [libc_text, libc_text_end): the upper half's
+  char *libc_text_end;   //   libc's code, where malloc calls sbrk()
+} UhBrk;
+
+// The upper half's sbrk(); patchSbrk() passes the heap's state in 'h'.
+static void*
+uhSbrk(intptr_t increment, UhBrk *h)
+{
+  char *caller = (char*)__builtin_return_address(0);
+  void *ret = (void*)-1;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  if (caller < h->libc_text || caller >= h->libc_text_end) {
+    // Not malloc: the kernel's break, which the upper half cannot move.
+    if (increment == 0) {
+      ret = (void*)syscall(SYS_brk, 0);
+    }
+  } else {
+    char *old = h->brk;
+    char *brk = old + increment;
+    if (brk >= h->base && brk <= h->end) {
+      char *from = (char*)ROUND_UP(old, PAGE_SIZE);
+      char *to = (char*)ROUND_UP(brk, PAGE_SIZE);
+      int rc = 0;
+      if (to > from) {
+        rc = mprotect(from, to - from, PROT_READ | PROT_WRITE);
+      } else if (to < from) {
+        // Released pages read as zeros when the heap grows again.
+        rc = madvise(to, from - to, MADV_DONTNEED);
+        if (rc == 0) {
+          rc = mprotect(to, from - to, PROT_NONE);
+        }
+      }
+      if (rc == 0) {
+        h->brk = brk;
+        ret = old;
+      }
+    }
+  }
+  RETURN_TO_UPPER_HALF();
+  return ret;
+}
+
+// Reserves the upper half's heap and makes its libc's sbrk() jump to
+// uhSbrk().  [libc_text, libc_text + len) is that libc's code.
+static void
+patchSbrk(char *sbrk, char *libc_text, size_t len)
+{
+#if defined(__x86_64__)
+  char *r = (char*)__mmap_wrapper(NULL, UH_BRK_RESERVE, PROT_NONE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                  -1, 0);
+  if (r == MAP_FAILED || mprotect(r, PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
+    DLOG(ERROR, "No heap for the upper half: %s\n", strerror(errno));
+    return;
+  }
+  UhBrk *h = (UhBrk*)r;
+  h->base = h->brk = r + PAGE_SIZE;
+  h->end = r + UH_BRK_RESERVE;
+  h->libc_text = libc_text;
+  h->libc_text_end = libc_text + len;
+
+  unsigned char stub[] = {
+    0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0,  // movabs $h, %rsi
+    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,  // movabs $uhSbrk, %rax
+    0xff, 0xe0                           // jmp *%rax
+  };
+  void *target = (void*)&uhSbrk;
+  memcpy(stub + 2, &h, sizeof(h));
+  memcpy(stub + 12, &target, sizeof(target));
+  char *page = (char*)((unsigned long)sbrk & ~(PAGE_SIZE - 1));
+  size_t page_len =
+    ROUND_UP(sbrk + sizeof(stub), PAGE_SIZE) - (unsigned long)page;
+  if (mprotect(page, page_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    DLOG(ERROR, "Cannot patch sbrk: %s\n", strerror(errno));
+    return;
+  }
+  memcpy(sbrk, stub, sizeof(stub));
+  mprotect(page, page_len, PROT_READ | PROT_EXEC);
+#endif
 }
 
 // This is a mmap wrapper only for restoring memory after restart.
@@ -330,6 +438,10 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
             return NULL;
           }
           patchLibc(fd, libc_base_addr, glibcFullPath);
+          off_t sbrk_offset = get_symbol_offset(glibcFullPath, "__sbrk");
+          if (sbrk_offset) {
+            patchSbrk(libc_base_addr + sbrk_offset, (char*)ret, length);
+          }
           rc = mprotect(ret, length, prot);
           if (rc < 0) {
             DLOG(ERROR, "Failed to restore perms for memory region at: %p "
@@ -372,6 +484,34 @@ static int __munmap_wrapper(void *addr, size_t length) {
   return ret;
 }
 
+// The MPI process, not a child that the upper half forked.  Set by the
+// lower half's main() at launch and again at restart.
+static pid_t lh_pid;
+
+void
+record_lower_half_pid()
+{
+  lh_pid = syscall(SYS_getpid);
+}
+
+// The upper half libc's _exit() jumps here (patchLibc()).  If the upper half
+// is in exit() (upper_half_exiting), end through the lower half's exit() so
+// that its exit handlers run too: MPICH sends PMI finalize from one, and
+// without it the process manager kills the other ranks.  A direct _exit()
+// and a child that the upper half forked just exit.
+static void
+uhExit(int status)
+{
+  if (lh_info->fsaddr != NULL) {
+    setFS((unsigned long)lh_info->fsaddr);
+  }
+  if (lh_info->upper_half_exiting && syscall(SYS_getpid) == lh_pid) {
+    exit(status);  // The lower half's
+  }
+  syscall(SYS_exit_group, status);
+  __builtin_unreachable();
+}
+
 static void patchLibc(int fd, char *base, char *glibc)
 {
   assert(base != NULL);
@@ -409,6 +549,13 @@ static void patchLibc(int fd, char *base, char *glibc)
   assert(munmap_offset);
   patch_trampoline(base + mmap_offset, reinterpret_cast<void*>(&mmap_wrapper));
   patch_trampoline(base + munmap_offset, reinterpret_cast<void*>(&munmap_wrapper));
+  off_t exit_offset = get_symbol_offset(glibc, "_exit");
+  if (exit_offset) {
+    patch_trampoline(base + exit_offset, reinterpret_cast<void*>(&uhExit));
+  } else {
+    DLOG(ERROR, "No _exit in %s: the lower half's exit handlers won't run\n",
+         glibc);
+  }
   // Restore file offset to not upset the caller
   lseek(fd, save_offset, SEEK_SET);
 }

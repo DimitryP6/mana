@@ -58,10 +58,11 @@ A typical workflow for using MANA after untar\'ing is:
 cd dmtcp-mana
 ./configure --enable-debug
 make -j mana
-# Compile against libmana.so: Examples at contrib/mpi-proxy-split/test
+# Build the program with mpicc as usual; no relinking for MANA is needed.
+# 'make' also builds an example: mpi-proxy-split/examples/ring
 salloc -N 2 -q interactive -C haswell -t 01:00:00
 bin/mana_coordinator -i10
-srun -N 2 bin/mana_launch <TARGET_DIR>/ping_pong.mana.exe
+srun -N 2 bin/mana_launch mpi-proxy-split/examples/ring
 bin/mana_coordinator -i10
 srun -N 2 bin/mana_restart
 ```
@@ -75,9 +76,28 @@ MANA supports most features of DMTCP, including:
 
 # ENVIRONMENT VARIABLES AND DEBUGGING
 
+**`MANA_P2P_WAIT`**
+
+: How `MPI_Send` and `MPI_Recv` wait for their message.  `polling` (the
+  default): as `MPI_Isend` or `MPI_Irecv`, then a loop of `MPI_Test` in MANA.
+  `blocking`: in the MPI library's own `MPI_Send` and `MPI_Recv`.  Both modes
+  checkpoint and restart the same way.  `polling` can be faster when the MPI
+  library's blocking wait yields the processor (MPICH 5).  `blocking` is
+  faster on Cray MPICH, and much faster when two ranks share a core.  In
+  `blocking` mode, MANA initializes the MPI library with
+  `MPI_THREAD_MULTIPLE`; with a library that does not provide it, `blocking`
+  can fail at a checkpoint (e.g., over UCX).  MANA reads the variable at
+  `MPI_Init` and keeps the mode after restart.
+
 **`MANA_DEBUG`**
 
 : MANA will print to stderr extra information to help developers debug MANA.
+
+**`MANA_PRELOAD`**
+
+: A colon-separated list of libraries that `mana_launch` loads ahead of MANA,
+  so that they intercept MPI calls before MANA does (e.g., a PMPI profiler).
+  A library in `LD_PRELOAD` loads after them.
 
 **`DMTCP_MANA_PAUSE` or `DMTCP_LAUNCH_PAUSE`**
 
@@ -106,34 +126,6 @@ MANA supports most features of DMTCP, including:
   MPI_Send/Recv by copying MPI wrappers from mpi_collective_p2p.c to
   mpi_collective_wrappers.cpp in the mpi-wrappers subdirectory; or
   block certain translations by adjusting `#ifdef/#ifndef MPI_COLLECTIVE_P2P` in those files.
-
-**`MANA_P2P_LOG`\"**
-
-: For debugging: Set this before mana_launch in order to log the
-  order of point-to-point calls (MPI_Send and family) for later
-  deterministic replay. See details at top of
-  `mpi-proxy-split/mpi-wrappers/p2p-deterministic.c`.
-
-  (IMPORTANT: If you checkpoint, continue running for a few minutes after that,
-  for final updating of the log files.)
-
-**`MANA_P2P_REPLAY`**
-
-: For debugging: If a checkpoint was created with `MANA_P2P_LOG`, then
-  execute `mana_p2p_update_logs` and set this variable before
-  `mana_restart`. (Currently, you need to set this before `mana_launch`,
-  but this may be fixed later.)
-
-**`MANA_USE_ALLREDUCE_REPRODUCIBLE`**
-
-  When MPI_Allreduce specifies an associative/commutative operation,
-  the MPI library must choose an ordering of the operation during
-  reduce.  The ordering may vary when calling MPI_Allreqduce after
-  launch or after replay.  By setting the environment variable
-  MANA_USE_ALLREDUCE_REPRODUCIBLE at the time of launch,
-  you can direct MANA to call the operations in a deterministic order,
-  so that the output after checkpoint-restart will produce the same
-  output as running after launch with no checkpoint-restart.
 
 **`INSPECTING MANA for DEBUGGING`**
 

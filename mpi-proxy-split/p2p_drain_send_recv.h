@@ -35,28 +35,41 @@ extern int *g_recvBytesByRank; // Number of bytes received from other ranks
 #endif
 extern int64_t global_sent_messages, global_recv_messages;
 extern int64_t local_sent_messages, local_recv_messages;
+
+// The application thread and, during a checkpoint, the drain (the checkpoint
+// thread) both count received messages.  Release: MPI_Recv's store to
+// g_pending_recv.state must be visible before its count.
+static inline void
+count_received_message()
+{
+  __atomic_fetch_add(&local_recv_messages, 1, __ATOMIC_RELEASE);
+}
 extern std::unordered_set<MPI_Comm> active_comms;
 extern dmtcp::vector<mpi_message_t*> g_message_queue;
 
-// State of a single pending blocking MPI_Recv.
+// State of the single pending blocking MPI_Recv.  MANA does not support
+// MPI_THREAD_MULTIPLE; supporting it would need one slot per thread.
 //
-// MANA does not support MPI_THREAD_MULTIPLE.  Therefore at most one
-// MPI_Recv can be in flight per process at any time, and a single
-// global slot suffices to record its parameters.  If MPI_THREAD_MULTIPLE
-// support is ever added, this slot will need to become per-thread, and
-// the kvdb publish in unblockPendingRecvs() will need to publish a
+// 'state' is changed by the MPI_Recv wrapper and by the P2P drain
+// (checkpoint thread, pre-suspend):
+//   IDLE:   no MPI_Recv is in the lower half.
+//   ACTIVE: an MPI_Recv is in, or entering, the lower half; the fields
+//           below describe it.
+//   CLOSED: set when the P2P drain begins or after a dummy.  No MPI_Recv may
+//           enter the lower half until resetDrainCounters() sets IDLE.
+// Both threads leave IDLE by compare-and-swap, so exactly one wins: the
+// MPI_Recv enters the lower half and gets a dummy, or it waits in the upper
+// half until the checkpoint is over.
+enum { PENDING_RECV_IDLE, PENDING_RECV_ACTIVE, PENDING_RECV_CLOSED };
 
-  // It is read by unblockPendingRecvs() running in the DMTCP coordinator
-// thread during pre-suspend.  Declared volatile for cross-thread
-// visibility.
 typedef struct {
-  volatile bool active;
-  // The following fields are valid only when active is true.
+  int state;
+  // The following fields are valid only when state is PENDING_RECV_ACTIVE.
   int source;     // user-provided value; may be MPI_ANY_SOURCE
   int tag;        // user-provided value; may be MPI_ANY_TAG
   MPI_Comm comm;  // virtual communicator
   int count;      // user-provided count (needed for dummy buffer size)
-  MPI_Datatype datatype;  // virtual datatype handle (needed for dummy matching)
+  MPI_Datatype datatype;  // virtual datatype handle (for the size of the dummy)
 } pending_recv_t;
 
 extern pending_recv_t g_pending_recv;
@@ -90,6 +103,13 @@ extern pending_recv_t g_pending_recv;
 //     receiver's post-call read sees true.
 extern volatile bool p2p_dummy_phase;
 
+// How MPI_Send, MPI_Rsend and MPI_Recv wait (MANA_P2P_WAIT, read at MPI_Init
+// and kept after restart).  POLLING (default): MPI_Isend/MPI_Irecv, then
+// MANA's MPI_Wait (an MPI_Test loop); no thread blocks in the lower half.
+// BLOCKING: in the lower half; a blocked MPI_Recv gets a dummy at checkpoint.
+enum p2p_wait_t { P2P_WAIT_BLOCKING, P2P_WAIT_POLLING };
+extern p2p_wait_t g_p2p_wait;
+
 void initialize_drain_send_recv();
 void registerLocalSendsAndRecvs();
 
@@ -105,8 +125,50 @@ void drainInFlightP2p();
 void unblockPendingRecvs();
 
 // Single entry point for draining all P2P communications before
-// checkpoint: drains in-flight messages, then unblocks pending recvs.
+// checkpoint: drains in-flight messages, then unblocks pending recvs.  If
+// drainHasNoBarrier(), it also completes the pending non-blocking
+// collectives, and it uses no barrier (see drainWithoutBarriers()).
 void drainP2p();
+
+// True with MANA_P2P_WAIT=polling, and with blocking if the lower half has a
+// TLS for the checkpoint thread (MPI_THREAD_MULTIPLE).
+bool drainHasNoBarrier();
+
+// What the drain did on this rank at one checkpoint (times in
+// microseconds); see reportDrainStats().
+struct DrainStats {
+  uint64_t t_collective;     // Collective Clock drain, NBCs, barrier
+  uint64_t t_inflight;       // drainInFlightP2p()
+  uint64_t t_register;       //   exchanging the send/recv counters
+  uint64_t t_complete;       //   completing pending MPI_Isend/MPI_Irecv
+  uint64_t t_probe;          //   probing communicators, buffering messages
+  uint64_t t_isends;         //   completing the remaining MPI_Isends
+  uint64_t t_done;           //   polling: waiting until all ranks are done
+  uint64_t t_unblock;        // unblockPendingRecvs()
+  uint64_t t_publish;        //   publishing whether blocked in MPI_Recv
+  uint64_t t_published;      //   barrier after publishing
+  uint64_t t_post;           //   posting the dummy to its sender
+  uint64_t t_posted;         //   barrier after posting
+  uint64_t t_dispatch;       //   sending the dummies posted to this rank
+  uint64_t t_dispatched;     //   barrier after sending
+  uint64_t t_wait_lower_half;  // wait_for_threads_to_leave_lower_half()
+  int64_t iterations;        // rounds of the in-flight drain
+  int64_t comms_probed;
+  int64_t iprobes;
+  int64_t drained_msgs;      // moved to MANA's buffer
+  int64_t drained_bytes;
+  int64_t irecvs_completed;  // pending MPI_Irecvs that received a message
+  int64_t isends_completed;
+  int64_t blocked;           // ranks blocked in MPI_Recv
+  int64_t dummies;           // dummy messages sent
+  int64_t kvdb_requests;     // requests to the coordinator's database
+  int64_t done_polls;        // polling: polls of the "done" counter
+  int64_t barriers;          // global barriers
+};
+extern DrainStats g_drain_stats;
+uint64_t drainStatsNow();   // microseconds
+void resetDrainStats();
+void reportDrainStats();
 
 int drainRemainingP2pMsgs(int source);
 int recvMsgIntoInternalBuffer(MPI_Status status);

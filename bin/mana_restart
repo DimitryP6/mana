@@ -46,6 +46,46 @@ if "--restartdir" in dmtcp_flags:
               ": Restart directory has .tmp files. ")
         print("Previous checkpoint may be incomplete.")
         sys.exit(1)
+# The new lower half starts MPI for the checkpoint's MANA_P2P_WAIT, which
+# header.mana ("name=value" lines) records as p2p_wait, and keeps free the fd
+# numbers that its rank had open (fds), for DMTCP's restore.  If the launcher
+# does not tell the rank, it keeps free those of all ranks.
+restart_dir = "./"
+if "--restartdir" in dmtcp_flags:
+  restart_dir = dmtcp_flags[dmtcp_flags.index("--restartdir") + 1]
+
+def read_header(header):
+  with open(header, errors="replace") as f:
+    return dict(line.strip().split("=", 1) for line in f if "=" in line)
+
+headers = []
+for var in ("PMI_RANK", "PMIX_RANK", "SLURM_PROCID"):
+  if os.environ.get(var, "").isdigit():
+    own = os.path.join(restart_dir, "ckpt_rank_" + os.environ[var],
+                       "header.mana")
+    if os.path.isfile(own):
+      headers = [own]
+    break
+if not headers:
+  for rank_dir in sorted(os.listdir(restart_dir)):
+    header = os.path.join(restart_dir, rank_dir, "header.mana")
+    if os.path.isfile(header):
+      headers.append(header)
+p2p_wait = None
+# reserved_fds: fd numbers open at checkpoint (fds= from save_mana_header()).
+# DMTCP's restore dup2()s the upper half's fds back onto them, closing any fd
+# the new lower half already opened there.
+reserved_fds = set()
+for header in headers:
+  fields = read_header(header)
+  if p2p_wait is None and fields.get("p2p_wait") in ("polling", "blocking"):
+    p2p_wait = fields["p2p_wait"]
+  reserved_fds.update(int(x) for x in fields.get("fds", "").split(",")
+                      if x.isdigit())
+if p2p_wait is not None:
+  os.environ["MANA_P2P_WAIT"] = p2p_wait
+if reserved_fds:
+  os.environ["MANA_RESERVED_FDS"] = ",".join(map(str, sorted(reserved_fds)))
 if "--ckptdir" in dmtcp_flags:
   ckptdir_path = dmtcp_flags[dmtcp_flags.index("--ckptdir") + 1]
   if not os.path.exists(ckptdir_path):
@@ -78,7 +118,7 @@ rc_file = open(rc_filename)
 for line in rc_file:
   line = line.split()
   if not line:
-    break
+    continue
   if line[0] == "Host:":
     host_flag = " -h " + line[1] + " "
   elif line[0] == "Port:":
@@ -89,7 +129,7 @@ rc_file.close()
 os.system("find $HOME/.mana*.rc -ignore_readdir_race -maxdepth 0 -mtime +7 -type f -delete")
 
 # Check dmtcp coordinator
-coordinator_found = os.system(mana_root_path + "bin/dmtcp_command -s " + host_flag + port_flag + " &>/dev/null")
+coordinator_found = os.system(mana_root_path + "bin/dmtcp_command -s " + host_flag + port_flag + " >/dev/null 2>&1")
 if coordinator_found != 0:
   print("No MANA coordinator detected. Try:")
   print("  " + mana_root_path + "bin/dmtcp_coordinator")

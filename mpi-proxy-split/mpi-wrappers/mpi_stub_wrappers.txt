@@ -1,21 +1,10 @@
-// This is used to generate libmpistub.so.  It should contain the same symbols
-//   as libmpi.so.  This is to allow end users to compile an upper half linked
-//   against libmpistub.so, so that it can be loaded even if the original
-//   libmpi.so is no longer present.
-// At compile-time, the Makefile of an MPI application may still compile against
-//   libmpi.so, libmpich.so, etc.  The top-level lib/dmtcp directory has
-//   symbolic links for these libraries, that link to libmpistub.so.
-//   By convention, these executables have file type ./mana.exe .
-//   Hence, as long as a lower-half (static) MPI library is present, we don't
-//   need the dynamic MPI library to build the upper-half executable.
-// At runtime, using mana_launch or dmtcp_launch, the library libmana.so will be
-//   preloaded by setting LD_PRELOAD.  Normally, libmana.so includes all
-//   symbols present in a libmpi.so.  So libmpistub.so normally is never
-//   called ar tuntime.
-//   (Note that mpi_unimplemented_wrappers.cpp is also compiled into libmana.so.)
-// In principle, MANA could be launched with a native MPI executable (e.g., .exe)
-//   instead of an executable of type .mana.exe.
-//   FIXME:  Does it work to just use the .exe file?
+// This is used to generate libmpistub.so: one function, an assert(0), for
+//   each MPI function of libmpi.so.  libmpistub.so stands in for the MPI
+//   library in the upper half: the upper half loads it in place of the
+//   application's MPI library (see mpi_stub_audit.c), and a program may also
+//   be linked with it.  libmana.so, preloaded, takes the MPI calls (with
+//   mpi_unimplemented_wrappers.cpp for those that MANA does not support), so
+//   no function of libmpistub.so is called.
 
 // native signatures from local mpi.h conflict with this.
 // #include <mpi.h>;
@@ -431,6 +420,39 @@ int MPI_Type_contiguous(int count, MPI_Datatype oldtype, MPI_Datatype *newtype);
 int MPI_Init_thread(int *argc, char ***argv, int required, int *provided);
 int MPI_Get_count(const MPI_Status *status, MPI_Datatype datatype, int *count);
 int MPI_Group_incl(MPI_Group group, int n, const int ranks[], MPI_Group *newgroup);
+
+// The tool information interface (libmana's mpi_t_wrappers.cpp);
+int MPI_T_init_thread(int required, int *provided);
+int MPI_T_finalize(void);
+int MPI_T_enum_get_info(MPI_T_enum enumtype, int *num, char *name, int *name_len);
+int MPI_T_enum_get_item(MPI_T_enum enumtype, int indx, int *value, char *name, int *name_len);
+int MPI_T_cvar_get_num(int *num_cvar);
+int MPI_T_cvar_get_info(int cvar_index, char *name, int *name_len, int *verbosity, MPI_Datatype *datatype, MPI_T_enum *enumtype, char *desc, int *desc_len, int *bind, int *scope);
+int MPI_T_cvar_get_index(const char *name, int *cvar_index);
+int MPI_T_cvar_handle_alloc(int cvar_index, void *obj_handle, MPI_T_cvar_handle *handle, int *count);
+int MPI_T_cvar_handle_free(MPI_T_cvar_handle *handle);
+int MPI_T_cvar_read(MPI_T_cvar_handle handle, void *buf);
+int MPI_T_cvar_write(MPI_T_cvar_handle handle, const void *buf);
+int MPI_T_pvar_get_num(int *num_pvar);
+int MPI_T_pvar_get_info(int pvar_index, char *name, int *name_len, int *verbosity, int *var_class, MPI_Datatype *datatype, MPI_T_enum *enumtype, char *desc, int *desc_len, int *bind, int *readonly, int *continuous, int *atomic);
+int MPI_T_pvar_get_index(const char *name, int var_class, int *pvar_index);
+int MPI_T_pvar_session_create(MPI_T_pvar_session *session);
+int MPI_T_pvar_session_free(MPI_T_pvar_session *session);
+int MPI_T_pvar_handle_alloc(MPI_T_pvar_session session, int pvar_index, void *obj_handle, MPI_T_pvar_handle *handle, int *count);
+int MPI_T_pvar_handle_free(MPI_T_pvar_session session, MPI_T_pvar_handle *handle);
+int MPI_T_pvar_start(MPI_T_pvar_session session, MPI_T_pvar_handle handle);
+int MPI_T_pvar_stop(MPI_T_pvar_session session, MPI_T_pvar_handle handle);
+int MPI_T_pvar_read(MPI_T_pvar_session session, MPI_T_pvar_handle handle, void *buf);
+int MPI_T_pvar_write(MPI_T_pvar_session session, MPI_T_pvar_handle handle, const void *buf);
+int MPI_T_pvar_reset(MPI_T_pvar_session session, MPI_T_pvar_handle handle);
+int MPI_T_pvar_readreset(MPI_T_pvar_session session, MPI_T_pvar_handle handle, void *buf);
+int MPI_T_category_get_num(int *num_cat);
+int MPI_T_category_get_info(int cat_index, char *name, int *name_len, char *desc, int *desc_len, int *num_cvars, int *num_pvars, int *num_categories);
+int MPI_T_category_get_index(const char *name, int *cat_index);
+int MPI_T_category_get_cvars(int cat_index, int len, int indices[]);
+int MPI_T_category_get_pvars(int cat_index, int len, int indices[]);
+int MPI_T_category_get_categories(int cat_index, int len, int indices[]);
+int MPI_T_category_changed(int *update_number);
 
 // removed in MPI-3.0 (2012);
 #if 0;

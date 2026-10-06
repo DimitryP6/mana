@@ -19,6 +19,7 @@ LIBWRAPPER_OBJS = mana_cuda.o mpi_p2p_wrappers.o mpi_collective_wrappers.o \
                   mpi_wrappers.o get_fortran_constants.o fortran_constants.o \
                   mpi_win_wrappers.o mpi_file_wrappers.o mpi_error_wrappers.o \
                   p2p-deterministic.o 
+                  mpi_t_wrappers.o
 
 
 # Modify if your MANA_ROOT is located elsewhere.
@@ -40,7 +41,7 @@ override CXXFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${JALIB_INCLUDE} \
                      -I${LOWER_HALF_SRCDIR} -I/usr/local/cuda/include
 
 # We don't build libmpiwrappers.a.  Instead, we use *.o to build libmana.so.
-default: ${LIBNAME}.a libmpistub.so
+default: ${LIBNAME}.a libmpistub.so libmpistub_audit.so
 
 # If any .o file is re-built, then re-build mpi_collective_wrappers.o .
 # That recipe will test the environment variable: DEFINE_mpi_collective_p2p
@@ -58,23 +59,12 @@ mpi_unimplemented_wrappers.cpp: generate-mpi-unimplemented-wrappers.py \
 .c.o:
 	${MPICC} ${CFLAGS} -c -o $@ $<
 
-mana_p2p_update_logs: mana_p2p_update_logs.c
-	${MPICC} ${CFLAGS} -o $@ $<
-
-.cpp.o: ../virtual_id.h
+.cpp.o:
 	${MPICXX} ${CXXFLAGS} -c -o $@ $<
 
-p2p-deterministic.h: p2p-deterministic.txt p2p-deterministic.py
-	./p2p-deterministic.py $< > $@
-
-p2p-deterministic.o: p2p-deterministic.c p2p-deterministic.h
-	${MPICC} ${CFLAGS} -c -o $@ $<
-
-mpi_p2p_wrappers.o: mpi_p2p_wrappers.cpp p2p-deterministic.h
-	${MPICXX} ${CXXFLAGS} -c -o $@ $<
-
-mpi_request_wrappers.o: mpi_request_wrappers.cpp p2p-deterministic.h
-	${MPICXX} ${CXXFLAGS} -c -o $@ $<
+# Make ignores prerequisites on suffix rules, so list header dependencies
+# here: the headers that define inline code.
+$(filter mpi_%,${LIBWRAPPER_OBJS}): ../virtual_id.h ../lower_half_ckpt.h
 
 # FIXME:  This assumes 'CFLAGS' is compatible with FORTRAN, since MANA does not
 #         define 'FFLAGS'.  But Fortran doesn't use '-std=gnu11' from CFLAGS.
@@ -116,8 +106,13 @@ mpi_fortran_wrappers.cpp: generate-mpi-fortran-wrappers.py \
 mpi_stub_wrappers.o: mpi_stub_wrappers.c
 	${MPICC} ${CFLAGS} -c -o $@ $<
 
-libmpistub.so: mpi_stub_wrappers.o
-	${CC} -fPIC $< -shared -o $@
+libmpistub.so: mpi_stub_wrappers.o mpi_stub_data.o
+	${CC} -fPIC $^ -shared -o $@
+
+# An LD_AUDIT module for the upper half; it must not need libc.
+libmpistub_audit.so: mpi_stub_audit.c
+	${CC} -O2 -fPIC -shared -nostdlib -fno-stack-protector \
+	  -Wl,--no-undefined -o $@ $<
 
 libmpich_gnu_82.so.3.0.1: libmpistub.so
 	ln -sf $< $@
@@ -142,8 +137,8 @@ tidy:
 	rm -rf ckpt_rank_*
 	rm -f dmtcp_coordinator_db-*.json
 
-install: libmpistub.so mana_p2p_update_logs
-	cp -f libmpistub.so ${MANA_ROOT}/lib/dmtcp/
+install: libmpistub.so libmpistub_audit.so
+	cp -f libmpistub.so libmpistub_audit.so ${MANA_ROOT}/lib/dmtcp/
 	cd ${MANA_ROOT}/lib/dmtcp && \
 		ln -sf libmpistub.so libmpich_intel.so.3.0.1 && \
 		ln -sf libmpich_intel.so.3.0.1 libmpich_intel.so.3 && \
@@ -152,14 +147,13 @@ install: libmpistub.so mana_p2p_update_logs
 	cd ${MANA_ROOT}/lib/dmtcp && \
 		ln -sf libmpistub.so libpmi.so.0.5.0 && \
 		ln -sf libpmi.so.0.5.0 libpmi.so.0
-	cp -f mana_p2p_update_logs ${MANA_ROOT}/bin/
 
 clean: tidy
 	rm -f ${LIBWRAPPER_OBJS}
-	rm -f ${LIBNAME}.a libmpistub.so
+	rm -f ${LIBNAME}.a libmpistub.so mpi_stub_data.o libmpistub_audit.so
 	rm -f ${MANA_ROOT}/lib/dmtcp/libmpistub.so
+	rm -f ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so
 	rm -f mpi_stub_wrappers.c
-	rm -f p2p-deterministic.h
 	rm -f mpi_unimplemented_wrappers.cpp
 	rm -f mpi_fortran_wrappers.cpp
 	rm -f libmpich_intel.so.3.0.1 libmpich_intel.so.3

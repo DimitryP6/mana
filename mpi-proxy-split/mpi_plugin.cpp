@@ -30,22 +30,19 @@
 #include <sys/personality.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#ifdef SINGLE_CART_REORDER
-#include "cartesian.h"
-#endif
 
 #include <cxxabi.h>  /* For backtrace() */
 #include <execinfo.h>  /* For backtrace() */
 
 #include <regex>
 
+#include "jconvert.h"
 #include "mpi_files.h"
-#include "mana_header.h"
 #include "mpi_plugin.h"
 #include "lower-half-api.h"
+#include "lower_half_ckpt.h"
 #include "p2p_log_replay.h"
 #include "p2p_drain_send_recv.h"
-#include "record-replay.h"
 #include "seq_num.h"
 #include "mpi_nextfunc.h"
 #include "virtual_id.h"
@@ -68,17 +65,12 @@ using dmtcp::kvdb::KVDBRequest;
 using dmtcp::kvdb::KVDBResponse;
 
 /* Global variables */
-#ifdef SINGLE_CART_REORDER
-extern CartesianProperties g_cartesian_properties;
-#endif
-
 void * lh_ckpt_mem_addr = NULL;
 size_t lh_ckpt_mem_size = 0;
 int pagesize = sysconf(_SC_PAGESIZE);
 get_mmapped_list_fptr_t get_mmapped_list_fnc = NULL;
 std::vector<MmapInfo_t> uh_mmaps;
 
-extern ManaHeader g_mana_header;
 extern std::unordered_map<MPI_File, OpenFileParameters> g_params_map;
 
 bool g_libmana_is_initialized = false;
@@ -327,7 +319,7 @@ dmtcp_skip_memory_region_ckpting(ProcMapsArea *area)
     return 1;
   }
 
-  if (strstr(area->name, "heap")) {
+  if (strcmp(area->name, "[heap]") == 0) {
     JTRACE("Ignoring heap region")(area->name)((void*)area->addr);
     return 1;
   }
@@ -381,30 +373,6 @@ dmtcp_skip_memory_region_ckpting(ProcMapsArea *area)
     }
   }
   return 1;
-}
-
-EXTERNC int
-dmtcp_skip_truncate_file_at_restart(const char* path)
-{
-  constexpr const char* P2P_LOG_MSG = "p2p_log_%d.txt";
-  constexpr const char* P2P_LOG_REQUEST = "p2p_log_request_%d.txt";
-  char p2p_log_name[100];
-  char p2p_log_request_name[100];
-  int rank;
-
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  snprintf(p2p_log_name, sizeof(p2p_log_name) - 1, P2P_LOG_MSG, rank);
-  snprintf(p2p_log_request_name, sizeof(p2p_log_request_name)-1,
-           P2P_LOG_REQUEST, rank);
-
-  if (strstr(path, p2p_log_name) ||
-      strstr(path, p2p_log_request_name)) {
-    // Do not truncate this file.
-    return 1;
-  }
-
-  // Defer to the next plugin.
-  return NEXT_FNC(dmtcp_skip_truncate_file_at_restart)(path);
 }
 
 // TODO(kapil): Replace with Jassert::PrintBackrace.
@@ -619,6 +587,24 @@ get_mana_header_file_name()
   return strdup(o.str().c_str());
 }
 
+// After a restart, DMTCP has restored the upper half's fds over the
+// placeholders that the lower half kept them free with; close the others.
+static void
+closeReservedFds()
+{
+  if (lh_info->reserved_fd_ino == 0) {
+    return;
+  }
+  for (int fd : jalib::Filesystem::ListOpenFds()) {
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_dev == lh_info->reserved_fd_dev &&
+        st.st_ino == lh_info->reserved_fd_ino) {
+      close(fd);
+    }
+  }
+  lh_info->reserved_fd_ino = 0;
+}
+
 void
 save_mana_header(const char *filename)
 {
@@ -627,7 +613,22 @@ save_mana_header(const char *filename)
     return;
   }
 
-  write(fd, &g_mana_header.init_flag, sizeof(int));
+  // One "name=value" line per field.  mana_restart reads p2p_wait to start
+  // the new lower half in the same mode, and fds to keep these fd numbers
+  // free for DMTCP's restore (reserve_restart_fds() in the lower half).
+  ostringstream o;
+  o << "p2p_wait=" << (g_p2p_wait == P2P_WAIT_BLOCKING ? "blocking" : "polling")
+    << "\nfds=";
+  const char *sep = "";
+  for (int open_fd : jalib::Filesystem::ListOpenFds()) {
+    if (open_fd > 2 && open_fd != fd && !dmtcp_is_protected_fd(open_fd)) {
+      o << sep << open_fd;
+      sep = ",";
+    }
+  }
+  o << "\n";
+  string text = o.str();
+  write(fd, text.c_str(), text.size());
   close(fd);
 }
 
@@ -737,49 +738,6 @@ restore_mpi_files(const char *filename)
 
 }
 
-#ifdef SINGLE_CART_REORDER
-const char *
-get_cartesian_properties_file_name()
-{
-  struct stat st;
-  const char *ckptDir;
-  dmtcp::ostringstream o;
-
-  ckptDir = dmtcp_get_ckpt_dir();
-  if (stat(ckptDir, &st) == -1) {
-    mkdir(ckptDir, 0700); // Create directory if not already exist
-  }
-  o << ckptDir << "/cartesian.info";
-  return strdup(o.str().c_str());
-}
-
-void
-save_cartesian_properties(const char *filename)
-{
-  if (g_cartesian_properties.comm_old_size == -1 ||
-      g_cartesian_properties.comm_cart_size == -1 ||
-      g_cartesian_properties.comm_old_rank == -1 ||
-      g_cartesian_properties.comm_cart_rank == -1) {
-    return;
-  }
-  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-  if (fd == -1) {
-    return;
-  }
-  write(fd, &g_cartesian_properties.comm_old_size, sizeof(int));
-  write(fd, &g_cartesian_properties.comm_cart_size, sizeof(int));
-  write(fd, &g_cartesian_properties.comm_old_rank, sizeof(int));
-  write(fd, &g_cartesian_properties.comm_cart_rank, sizeof(int));
-  write(fd, &g_cartesian_properties.reorder, sizeof(int));
-  write(fd, &g_cartesian_properties.ndims, sizeof(int));
-  int array_size = sizeof(int) * g_cartesian_properties.ndims;
-  write(fd, g_cartesian_properties.coordinates, array_size);
-  write(fd, g_cartesian_properties.dimensions, array_size);
-  write(fd, g_cartesian_properties.periods, array_size);
-  close(fd);
-}
-#endif
-
 void printElapsedTime(time_t origin_time, const char *msg) {
   char time_string[30];
   time_t cur_time = time(NULL);
@@ -819,6 +777,23 @@ void printEventToStderr(const char *msg) {
   }
 }
 
+// No thread may be in the lower half when DMTCP suspends the threads.
+static void
+close_lower_half()
+{
+  uint64_t t = drainStatsNow();
+  wait_for_threads_to_leave_lower_half();  // lower_half_ckpt.cpp
+  g_drain_stats.t_wait_lower_half += drainStatsNow() - t;
+}
+
+static void
+close_lower_half_except_blocked()
+{
+  uint64_t t = drainStatsNow();
+  wait_for_unblocked_threads_to_leave_lower_half();  // lower_half_ckpt.cpp
+  g_drain_stats.t_wait_lower_half += drainStatsNow() - t;
+}
+
 static void
 mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 {
@@ -830,6 +805,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       initialize_signal_handlers();
       initialize_segv_handler();
       seq_num_init();
+      init_lower_half_ckpt();
       mana_state = RUNNING;
 
       DmtcpMutexInit(&g_upper_half_fsbase_lock, DMTCP_MUTEX_LLL);
@@ -900,6 +876,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
     case DMTCP_EVENT_PTHREAD_RETURN:
     case DMTCP_EVENT_PTHREAD_EXIT: {
+      unregister_lower_half_thread();
       // Do we need a mutex here?
       DmtcpMutexLock(&g_upper_half_fsbase_lock);
       pid_t real_tid = dmtcp_get_real_tid();
@@ -910,20 +887,66 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
     case DMTCP_EVENT_PRESUSPEND: {
       printEventToStderr("EVENT_PRESUSPEND (finish collective op's)");
+      // A rank still in MPI_Init has no MANA state yet (no rank, no
+      // g_world_comm).  Its MPI_Init can need the other ranks' progress,
+      // which their application threads keep making until the drains.
+      while (!__atomic_load_n(&g_libmpi_is_initialized, __ATOMIC_ACQUIRE)) {
+        usleep(1000);
+      }
+      resetDrainStats();  // p2p_drain_send_recv.cpp
+      uint64_t t0 = drainStatsNow();
       mana_state = CKPT_COLLECTIVE;
       // preSuspendBarrier() will send coord response and get worker state.
       // FIXME:  See commant at: dmtcpplugin.cpp:'case DMTCP_EVENT_PRESUSPEND'
       drain_mpi_collective();
+      // From here on, the checkpoint thread calls MPI.  With
+      // MANA_P2P_WAIT=polling, no thread waits in the lower half for the
+      // drain, so close it now (the lower half runs as MPI_THREAD_SINGLE).  In
+      // blocking mode, a blocked MPI_Recv stays there until the P2P drain
+      // sends it a dummy.  If the lower half runs as MPI_THREAD_MULTIPLE, the
+      // other threads leave now, and the checkpoint thread uses a lower-half
+      // TLS of its own; otherwise the lower half closes after the drain.
+      bool own_tls = lh_info->ckpt_fsaddr != NULL;
+      if (g_p2p_wait == P2P_WAIT_POLLING) {
+        close_lower_half();
+      } else if (own_tls) {
+        close_lower_half_except_blocked();
+      }
       dmtcp_global_barrier("MPI:Drain-Send-Recv");
+      g_drain_stats.t_collective =
+        drainStatsNow() - t0 - g_drain_stats.t_wait_lower_half;
       mana_state = CKPT_P2P;
+      if (own_tls) {
+        lh_info->ckpt_uh_fs = (void *)getFS();
+      }
       drainP2p(); // p2p_drain_send_recv.cpp
+      lh_info->ckpt_uh_fs = NULL;
       openCkptFileFds();
+      if (g_p2p_wait == P2P_WAIT_BLOCKING) {
+        close_lower_half();
+      }
+      // The lower half is closed now in both modes.  Without barriers
+      // (drainHasNoBarrier()), drainP2p() has completed the non-blocking
+      // collectives.
+      if (!drainHasNoBarrier()) {
+        uint64_t t_nbc = drainStatsNow();
+        complete_pending_nonblocking_collectives();  // seq_num.cpp
+        g_drain_stats.t_collective += drainStatsNow() - t_nbc;
+      }
+      reportDrainStats();  // With MANA_DRAIN_STATS set
       printEventToStderr("EVENT_PRESUSPEND (done)");
       break;
     }
 
     case DMTCP_EVENT_PRECHECKPOINT: {
       printEventToStderr("EVENT_PRECHECKPOINT (drain send/recv)");
+      // The threads are suspended now; let them back into the lower half
+      // when they resume.
+      allow_threads_to_enter_lower_half();
+      // dmtcp_skip_memory_region_ckpting() saves only the regions in
+      // uh_mmaps and refetches it when empty.  A stale list would miss the
+      // regions mapped since the last checkpoint.
+      uh_mmaps.clear();
       recordMpiInitMaps();
       recordOpenFds();
       dmtcp_local_barrier("MPI:GetLocalRankInfo");
@@ -936,11 +959,6 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       save_mana_header(file);
       const char *file2 = get_mpi_file_filename();
       save_mpi_files(file2);
-#ifdef SINGLE_CART_REORDER
-      dmtcp_global_barrier("MPI:save-cartesian-properties");
-      const char *file = get_cartesian_properties_file_name();
-      save_cartesian_properties(file);
-#endif
       printEventToStderr("EVENT_PRECHECKPOINT (done)");
       // Save a copy of the break address before checkpoint
       old_brk = sbrk(0);
@@ -988,14 +1006,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
                              // for easy debugging of lower half during restart.
                              // See definition in mpi-wrappers/mpi_wrappers.cpp
       mana_state = RESTART_REPLAY;
-#ifdef SINGLE_CART_REORDER
-      dmtcp_global_barrier("MPI:setCartesianCommunicator");
-      // record-replay.cpp
-      setCartesianCommunicator(lh_info->getCartesianCommunicatorFptr);
-#endif
-      dmtcp_global_barrier("MPI:restoreMpiLogState");
-      restoreMpiLogState(); // record-replay.cpp
-      dmtcp_global_barrier("MPI:record-replay.cpp-void");
+      dmtcp_global_barrier("MPI:replayMpiP2pOnRestart");
       replayMpiP2pOnRestart(); // p2p_log_replay.cpp
       dmtcp_local_barrier("MPI:p2p_log_replay.cpp-void");
       const char *file = get_mpi_file_filename();
@@ -1008,6 +1019,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
     case DMTCP_EVENT_RUNNING: {
       closeCkptFileFds();
+      closeReservedFds();
       break;
     }
 

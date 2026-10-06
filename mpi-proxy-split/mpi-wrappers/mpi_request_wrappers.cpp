@@ -21,23 +21,40 @@
  *  <http://www.gnu.org/licenses/>.                                         *
  ****************************************************************************/
 
+#include <unistd.h>
 #include "config.h"
 #include "dmtcp.h"
 #include "util.h"
 #include "jassert.h"
+#include "lower_half_ckpt.h"
 #include "jfilesystem.h"
 #include "protectedfds.h"
 
-#include "record-replay.h"
 #include "p2p_log_replay.h"
 #include "p2p_drain_send_recv.h"
 #include "mpi_plugin.h"
 #include "mpi_nextfunc.h"
 #include "virtual_id.h"
-// To support MANA_P2P_LOG and MANA_P2P_REPLAY:
-#include "p2p-deterministic.h"
 
-extern int p2p_deterministic_skip_save_request;
+// 'status', or NULL if the caller passed MPI_STATUS_IGNORE (C or Fortran).
+static inline MPI_Status *
+status_or_null(MPI_Status *status)
+{
+  if (status == MPI_STATUS_IGNORE || status == FORTRAN_MPI_STATUS_IGNORE) {
+    return NULL;
+  }
+  return status;
+}
+
+// A completed MPI_Irecv counts as a received message, unless it was from
+// MPI_PROC_NULL.
+static bool
+is_counted_irecv(MPI_Request request)
+{
+  mpi_nonblocking_call_t call;
+  return getPendingCall(request, &call) && call.type == IRECV_REQUEST &&
+         call.remote_node != MPI_PROC_NULL;
+}
 
 extern "C" {
 
@@ -50,6 +67,13 @@ int MPI_Test_internal(MPI_Request *request, int *flag, MPI_Status *status,
     real_request = *request;
   } else {
     real_request = get_real_id((mana_mpi_handle){.request = *request}).request;
+    // A receive that MANA completed for the application has its status in
+    // the request's entry (complete_virt_request()).
+    if (real_request == MPI_REQUEST_NULL &&
+        completed_request_status(*request, status_or_null(status))) {
+      *flag = 1;
+      return MPI_SUCCESS;
+    }
   }
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   // MPI_Test can change the *request argument
@@ -69,8 +93,7 @@ int PMPI_Test(MPI_Request* request, int* flag, MPI_Status* status)
     *flag = true;
     return MPI_SUCCESS;
   }
-  LOG_PRE_Test(status);
-  DMTCP_PLUGIN_DISABLE_CKPT();
+  LOWER_HALF_DISABLE_CKPT();
   MPI_Status statusBuffer;
   MPI_Status *statusPtr = status;
   if (statusPtr == MPI_STATUS_IGNORE ||
@@ -80,11 +103,16 @@ int PMPI_Test(MPI_Request* request, int* flag, MPI_Status* status)
   MPI_Request real_request;
   real_request = get_real_id((mana_mpi_handle){.request = *request}).request;
   if (*request != MPI_REQUEST_NULL && real_request == MPI_REQUEST_NULL) {
+    // MANA completed it: the P2P drain, or a message from MANA's buffer.  A
+    // receive has its status in the request's entry.
     *flag = 1;
+    completed_request_status(*request, status_or_null(status));
+    // The P2P drain unlinks the request after it completes it.
+    clearPendingRequestFromLog(*request);
+    release_freed_datatypes();
     free_virt_id((mana_mpi_handle){.request = *request});
     *request = MPI_REQUEST_NULL;
-    DMTCP_PLUGIN_ENABLE_CKPT();
-    // FIXME: We should also fill in the status
+    LOWER_HALF_ENABLE_CKPT();
     return MPI_SUCCESS;
   }
 
@@ -93,16 +121,17 @@ int PMPI_Test(MPI_Request* request, int* flag, MPI_Status* status)
   // FIXME: This if statement should be merged into
   // clearPendingRequestFromLog()
   if (*flag && *request != MPI_REQUEST_NULL
-      && g_nonblocking_calls.find(*request) != g_nonblocking_calls.end()
-      && g_nonblocking_calls[*request]->type == IRECV_REQUEST) {
-    local_recv_messages++;
+      && is_counted_irecv(*request)) {
+    count_received_message();
 #ifdef DEBUG_P2P
     int count = 0;
     int size = 0;
     MPI_Get_count(statusPtr, MPI_BYTE, &count);
     MPI_Type_size(MPI_BYTE, &size);
     JASSERT(size == 1)(size);
-    MPI_Comm comm = g_nonblocking_calls[*request]->comm;
+    mpi_nonblocking_call_t call;
+    getPendingCall(*request, &call);
+    MPI_Comm comm = call.comm;
     int worldRank = localRankToGlobalRank(statusPtr->MPI_SOURCE, comm);
     g_recvBytesByRank[worldRank] += count * size;
     // For debugging
@@ -112,14 +141,13 @@ int PMPI_Test(MPI_Request* request, int* flag, MPI_Status* status)
 #endif
 #endif
   }
-  LOG_POST_Test(request, statusPtr);
-  if (retval == MPI_SUCCESS && *flag && MPI_LOGGING()) {
+  if (retval == MPI_SUCCESS && *flag) {
     clearPendingRequestFromLog(*request);
+    release_freed_datatypes();
     free_virt_id((mana_mpi_handle){.request = *request});
-    LOG_REMOVE_REQUEST(*request); // remove from record-replay log
     *request = MPI_REQUEST_NULL;
   }
-  DMTCP_PLUGIN_ENABLE_CKPT();
+  LOWER_HALF_ENABLE_CKPT();
   return retval;
 }
 
@@ -207,7 +235,7 @@ int PMPI_Waitall(int count, MPI_Request *array_of_requests,
   // FIXME: Revisit this wrapper - call get_real_id on array
   int retval = MPI_SUCCESS;
 #if 0
-  DMTCP_PLUGIN_DISABLE_CKPT();
+  LOWER_HALF_DISABLE_CKPT();
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Waitall)(count, array_of_requests, array_of_statuses);
   RETURN_TO_UPPER_HALF();
@@ -216,7 +244,7 @@ int PMPI_Waitall(int count, MPI_Request *array_of_requests,
       clearPendingRequestFromLog(&array_of_requests[i]);
     }
   }
-  DMTCP_PLUGIN_ENABLE_CKPT();
+  LOWER_HALF_ENABLE_CKPT();
 #else
   // NOTE: See MPI_Testany above for the rationale for these variables.
   int local_count = count;
@@ -273,26 +301,27 @@ int PMPI_Waitany(int count, MPI_Request *array_of_requests,
         }
       }
       all_null = false;
-      DMTCP_PLUGIN_DISABLE_CKPT();
+      LOWER_HALF_DISABLE_CKPT();
       retval = MPI_Test_internal(&local_array_of_requests[i], &flag,
                                  local_status, false);
       if (retval != MPI_SUCCESS) {
-        DMTCP_PLUGIN_ENABLE_CKPT();
+        LOWER_HALF_ENABLE_CKPT();
         return retval;
       }
       if (flag) {
         MPI_Request *request = &local_array_of_requests[i];
         if (*request != MPI_REQUEST_NULL
-          && g_nonblocking_calls.find(*request) != g_nonblocking_calls.end()
-          && g_nonblocking_calls[*request]->type == IRECV_REQUEST) {
-          local_recv_messages++;
+          && is_counted_irecv(*request)) {
+          count_received_message();
 #ifdef DEBUG_P2P
           int count = 0;
           int size = 0;
           MPI_Get_count(local_status, MPI_BYTE, &count);
           MPI_Type_size(MPI_BYTE, &size);
           JASSERT(size == 1)(size);
-          MPI_Comm comm = g_nonblocking_calls[*request]->comm;
+          mpi_nonblocking_call_t call;
+          getPendingCall(*request, &call);
+          MPI_Comm comm = call.comm;
           int worldRank = localRankToGlobalRank(local_status->MPI_SOURCE, comm);
           g_recvBytesByRank[worldRank] += count * size;
 #endif
@@ -303,19 +332,18 @@ int PMPI_Waitany(int count, MPI_Request *array_of_requests,
           }
         }
 
-        if (MPI_LOGGING()) {
-          clearPendingRequestFromLog(local_array_of_requests[i]);
-          free_virt_id((mana_mpi_handle){.request = local_array_of_requests[i]});
-          local_array_of_requests[i] = MPI_REQUEST_NULL;
-        }
+        clearPendingRequestFromLog(local_array_of_requests[i]);
+        release_freed_datatypes();
+        free_virt_id((mana_mpi_handle){.request = local_array_of_requests[i]});
+        local_array_of_requests[i] = MPI_REQUEST_NULL;
 
         *local_index = i;
 
-        DMTCP_PLUGIN_ENABLE_CKPT();
+        LOWER_HALF_ENABLE_CKPT();
         return retval;
       }
 
-      DMTCP_PLUGIN_ENABLE_CKPT();
+      LOWER_HALF_ENABLE_CKPT();
     }
     if (all_null) {
       return retval;
@@ -341,27 +369,26 @@ int PMPI_Wait(MPI_Request *request, MPI_Status *status)
       statusPtr == FORTRAN_MPI_STATUS_IGNORE) {
     statusPtr = &statusBuffer;
   }
-  // FIXME: We translate the virtual request in every iteration.
-  // We want to translate it only once, and update the real request
-  // after restart if we checkpoint in the while loop.
-  // Then MPI_Test_internal should use isRealRequest = true.
+  // Translate the virtual request on every pass: a checkpoint's P2P drain
+  // or a restart can change the real request while we poll.
   while (!flag) {
-    DMTCP_PLUGIN_DISABLE_CKPT();
+    LOWER_HALF_DISABLE_CKPT();
     retval = MPI_Test_internal(request, &flag, statusPtr, false);
     // Updating global counter of recv bytes
     // FIXME: This if statement should be merged into
     // clearPendingRequestFromLog()
     if (flag && *request != MPI_REQUEST_NULL
-        && g_nonblocking_calls.find(*request) != g_nonblocking_calls.end()
-        && g_nonblocking_calls[*request]->type == IRECV_REQUEST) {
-      local_recv_messages++;
+        && is_counted_irecv(*request)) {
+      count_received_message();
 #ifdef DEBUG_P2P
       int count = 0;
       int size = 0;
       MPI_Get_count(statusPtr, MPI_BYTE, &count);
       MPI_Type_size(MPI_BYTE, &size);
       JASSERT(size == 1)(size);
-      MPI_Comm comm = g_nonblocking_calls[*request]->comm;
+      mpi_nonblocking_call_t call;
+      getPendingCall(*request, &call);
+      MPI_Comm comm = call.comm;
       int worldRank = localRankToGlobalRank(statusPtr->MPI_SOURCE, comm);
       g_recvBytesByRank[worldRank] += count * size;
     // For debugging
@@ -371,16 +398,13 @@ int PMPI_Wait(MPI_Request *request, MPI_Status *status)
 #endif
 #endif
     }
-    if (p2p_deterministic_skip_save_request == 0) {
-      if (flag) LOG_POST_Wait(request, statusPtr);
-    }
-    if (flag && MPI_LOGGING()) {
-      clearPendingRequestFromLog(*request); // Remove from g_nonblocking_calls
+    if (flag) {
+      clearPendingRequestFromLog(*request);  // Remove from pending calls
+      release_freed_datatypes();
       free_virt_id((mana_mpi_handle){.request = *request}); // Remove from virtual id
-      LOG_REMOVE_REQUEST(*request); // Remove from record-replay log
       *request = MPI_REQUEST_NULL;
     }
-    DMTCP_PLUGIN_ENABLE_CKPT();
+    LOWER_HALF_ENABLE_CKPT();
   }
   return retval;
 }
@@ -396,20 +420,50 @@ int PMPI_Probe(int source, int tag, MPI_Comm comm, MPI_Status *status)
   return retval;
 }
 
-#pragma weak MPI_Iprobe = PMPI_Iprobe
-int PMPI_Iprobe(int source, int tag, MPI_Comm comm, int *flag, MPI_Status *status)
+// MPI_Iprobe in the lower half, without MANA's buffer of drained messages:
+// for MANA itself (the P2P drain, the Collective Clock).
+int MPI_Iprobe_internal(int source, int tag, MPI_Comm comm, int *flag,
+                        MPI_Status *status)
 {
   int retval;
-  DMTCP_PLUGIN_DISABLE_CKPT();
-  // LOG_PRE_Iprobe(status);
-
+  LOWER_HALF_DISABLE_CKPT();
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Iprobe)(source, tag, realComm, flag, status);
   RETURN_TO_UPPER_HALF();
-  // LOG_POST_Iprobe(source,tag,comm,status);
-  // REPLAY_POST_Iprobe(source,tag,comm,status,flag);
-  DMTCP_PLUGIN_ENABLE_CKPT();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+#pragma weak MPI_Iprobe = PMPI_Iprobe
+int PMPI_Iprobe(int source, int tag, MPI_Comm comm, int *flag,
+                MPI_Status *status)
+{
+  int retval = MPI_SUCCESS;
+  // Neither lookup may write into Fortran's MPI_STATUS_IGNORE.
+  get_fortran_constants();
+  if (status == FORTRAN_MPI_STATUS_IGNORE) {
+    status = MPI_STATUS_IGNORE;
+  }
+  // As in MPI_Recv: don't probe while the P2P drain runs; the probe could
+  // report a later message ahead of one that the drain buffers.
+  while (mana_state == CKPT_P2P) {
+    usleep(100);
+  }
+  // A message that a checkpoint drained is older than any message of the
+  // same sender that the MPI library holds, so report it first, as MPI_Recv
+  // receives it first.  Both lookups are in one section: no checkpoint can
+  // drain a message between them.
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Status buffered_status;
+  if (existsMatchingMsgBuffer(source, tag, comm, flag, &buffered_status)) {
+    if (status != MPI_STATUS_IGNORE) {
+      *status = buffered_status;
+    }
+  } else {
+    retval = MPI_Iprobe_internal(source, tag, comm, flag, status);
+  }
+  LOWER_HALF_ENABLE_CKPT();
   return retval;
 }
 
@@ -417,12 +471,23 @@ int PMPI_Iprobe(int source, int tag, MPI_Comm comm, int *flag, MPI_Status *statu
 int PMPI_Request_get_status(MPI_Request request, int *flag, MPI_Status *status)
 {
   int retval;
-  DMTCP_PLUGIN_DISABLE_CKPT();
+  // The MPI library must not write into Fortran's MPI_STATUS_IGNORE.
+  if (status == FORTRAN_MPI_STATUS_IGNORE) {
+    status = MPI_STATUS_IGNORE;
+  }
+  LOWER_HALF_DISABLE_CKPT();
   MPI_Request real_request = get_real_id((mana_mpi_handle){.request = request}).request;
+  if (real_request == MPI_REQUEST_NULL &&
+      completed_request_status(request, status_or_null(status))) {
+    // A receive that MANA completed (see MPI_Test_internal()).
+    *flag = 1;
+    LOWER_HALF_ENABLE_CKPT();
+    return MPI_SUCCESS;
+  }
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Request_get_status)(real_request, flag, status);
   RETURN_TO_UPPER_HALF();
-  DMTCP_PLUGIN_ENABLE_CKPT();
+  LOWER_HALF_ENABLE_CKPT();
   return retval;
 }
 
@@ -431,11 +496,11 @@ int PMPI_Get_elements(const MPI_Status *status, MPI_Datatype datatype,
                      int *count)
 {
   int retval;
-  DMTCP_PLUGIN_DISABLE_CKPT();
+  LOWER_HALF_DISABLE_CKPT();
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Get_elements)(status, datatype, count);
   RETURN_TO_UPPER_HALF();
-  DMTCP_PLUGIN_ENABLE_CKPT();
+  LOWER_HALF_ENABLE_CKPT();
   return retval;
 }
 
@@ -444,11 +509,11 @@ int PMPI_Get_elements_x(const MPI_Status *status, MPI_Datatype datatype,
                        MPI_Count *count)
 {
   int retval;
-  DMTCP_PLUGIN_DISABLE_CKPT();
+  LOWER_HALF_DISABLE_CKPT();
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Get_elements_x)(status, datatype, count);
   RETURN_TO_UPPER_HALF();
-  DMTCP_PLUGIN_ENABLE_CKPT();
+  LOWER_HALF_ENABLE_CKPT();
   return retval;
 }
 

@@ -6,13 +6,12 @@
 #include <semaphore.h>
 
 #include "jassert.h"
+#include "jconvert.h"
 #include "kvdb.h"
 #include "seq_num.h"
 #include "mpi_nextfunc.h"
 #include "virtual_id.h"
-#include "record-replay.h"
 
-using namespace dmtcp_mpi;
 using dmtcp::kvdb::KVDBRequest;
 using dmtcp::kvdb::KVDBResponse;
 
@@ -20,11 +19,15 @@ using dmtcp::kvdb::KVDBResponse;
 
 constexpr int MAX_DRAIN_ROUNDS = 200;
 
+extern "C" int MPI_Iprobe_internal(int source, int tag, MPI_Comm comm,
+                                   int *flag, MPI_Status *status);
+extern "C" int MPI_Test_internal(MPI_Request *request, int *flag,
+                                 MPI_Status *status, bool isRealRequest);
+
 extern int g_world_rank;
 extern int g_world_size;
 // Global communicator for MANA internal use
 MPI_Comm g_world_comm;
-extern int p2p_deterministic_skip_save_request;
 volatile bool ckpt_pending;
 int converged;
 volatile phase_t current_phase = IS_READY;
@@ -104,6 +107,28 @@ void seq_num_broadcast(MPI_Comm comm, unsigned long new_target) {
   RETURN_TO_UPPER_HALF();
 }
 
+// Finds the Collective Clock state of 'comm' in its virtual-ID entry.
+// MPI_COMM_WORLD uses g_world_comm's entry; other predefined communicators,
+// which have no entry, use the maps.
+static inline void
+lookup_comm_clock(MPI_Comm comm, unsigned int *comm_gid,
+                  unsigned long **comm_seq, unsigned long **comm_target)
+{
+  MPI_Comm virt_comm = (comm == MPI_COMM_WORLD) ? g_world_comm : comm;
+  virt_id_entry *entry =
+    lookup_virt_id_entry((mana_mpi_handle){.comm = virt_comm});
+  if (entry != NULL) {
+    mana_comm_desc *desc = (mana_comm_desc*)entry->desc;
+    *comm_gid = desc->ggid;
+    *comm_seq = desc->seq_num;
+    *comm_target = desc->target;
+  } else {
+    *comm_gid = ggid_table[comm];
+    *comm_seq = &seq_num[*comm_gid];
+    *comm_target = &target[*comm_gid];
+  }
+}
+
 void commit_begin(MPI_Comm comm) {
   if (mana_state == RESTART_REPLAY || comm == MPI_COMM_NULL) {
     return;
@@ -111,7 +136,8 @@ void commit_begin(MPI_Comm comm) {
   while (ckpt_pending && check_seq_nums()) {
     MPI_Status status;
     int flag;
-    MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag, &status);
+    MPI_Iprobe_internal(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag,
+                        &status);
     if (flag) {
       unsigned long new_target[2];
       MPI_Comm real_world_comm = get_real_id((mana_mpi_handle){.comm = g_world_comm}).comm;
@@ -134,14 +160,16 @@ void commit_begin(MPI_Comm comm) {
       }
     }
   }
+  unsigned int comm_gid;
+  unsigned long *comm_seq, *comm_target;
   pthread_mutex_lock(&seq_num_lock);
   current_phase = IN_CS;
-  unsigned int comm_gid = ggid_table[comm];
-  seq_num[comm_gid]++;
+  lookup_comm_clock(comm, &comm_gid, &comm_seq, &comm_target);
+  (*comm_seq)++;
   pthread_mutex_unlock(&seq_num_lock);
-  if (ckpt_pending && seq_num[comm_gid] > target[comm_gid]) {
-    target[comm_gid] = seq_num[comm_gid];
-    seq_num_broadcast(comm, seq_num[comm_gid]);
+  if (ckpt_pending && *comm_seq > *comm_target) {
+    *comm_target = *comm_seq;
+    seq_num_broadcast(comm, *comm_seq);
   }
 }
 
@@ -153,7 +181,8 @@ void commit_finish(MPI_Comm comm) {
   while (ckpt_pending && check_seq_nums()) {
     MPI_Status status;
     int flag;
-    MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag, &status);
+    MPI_Iprobe_internal(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag,
+                        &status);
     if (flag) {
       unsigned long new_target[2];
       MPI_Comm real_world_comm = get_real_id((mana_mpi_handle){.comm = g_world_comm}).comm;
@@ -282,4 +311,51 @@ drain_mpi_collective()
 
     attemptId++;
   }
+}
+
+// Completes the pending non-blocking collectives with MPI_Test.  Call it
+// after drain_mpi_collective(): all ranks have then initiated the same
+// collectives and commit_begin() blocks new ones, so each request completes.
+// Call it with the lower half closed, so that no application thread is in
+// MPI or tests these requests meanwhile.  The request then maps to
+// MPI_REQUEST_NULL, so the application's later MPI_Wait/MPI_Test on it
+// returns at once.  A rank that finishes first may stop calling MPI: its
+// request completes only after its own part is done.
+void
+complete_pending_nonblocking_collectives()
+{
+  for (MPI_Request request : pending_collective_requests()) {
+    int flag = 0;
+    MPI_Status status;
+    while (!flag) {
+      int rc = MPI_Test_internal(&request, &flag, &status, false);
+      JASSERT(rc == MPI_SUCCESS)(rc)
+        .Text("MPI_Test failed on a pending non-blocking collective");
+    }
+    update_virt_id((mana_mpi_handle){.request = request},
+                   (mana_mpi_handle){.request = MPI_REQUEST_NULL});
+  }
+}
+
+// Tests each pending non-blocking collective once, under the same conditions
+// as complete_pending_nonblocking_collectives(), and returns how many are
+// still pending.
+int
+test_pending_nonblocking_collectives()
+{
+  int pending = 0;
+  for (MPI_Request request : pending_collective_requests()) {
+    int flag = 0;
+    MPI_Status status;
+    int rc = MPI_Test_internal(&request, &flag, &status, false);
+    JASSERT(rc == MPI_SUCCESS)(rc)
+      .Text("MPI_Test failed on a pending non-blocking collective");
+    if (flag) {
+      update_virt_id((mana_mpi_handle){.request = request},
+                     (mana_mpi_handle){.request = MPI_REQUEST_NULL});
+    } else {
+      pending++;
+    }
+  }
+  return pending;
 }

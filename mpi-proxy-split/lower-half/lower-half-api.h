@@ -46,14 +46,13 @@ typedef struct _LowerHalfInfo
 {
   void *fsaddr; // The base value of the FS register of the lower half
   int fsgsbase_enabled;
-#ifdef SINGLE_CART_REORDER
-  void *getCoordinatesFptr; // Pointer to getCoordinates() function in the lower half
-  void *getCartesianCommunicatorFptr; // Pointer to getCartesianCommunicator() function in the lower half
-#endif
   void *mmap;
   void *munmap;
   void *mmap_list_fptr;
   void *lh_dlsym;
+  // Set by an upper-half atexit() handler: uhExit() then ends the process
+  // through the lower half's exit(), so that its exit handlers run too.
+  int upper_half_exiting;
   char *uh_stack_start;
   char *uh_stack_end;
   char *uh_next_free_addr;
@@ -165,9 +164,38 @@ typedef struct _LowerHalfInfo
   MPI_Datatype MANA_COUNT;
   MPI_Errhandler MANA_ERRORS_ARE_FATAL;
   MPI_Errhandler MANA_ERRORS_RETURN;
+  // Blocking mode with MPI_THREAD_MULTIPLE: the FS of
+  // lh_thread_for_extra_tls(), which the checkpoint thread uses in the lower
+  // half, and the checkpoint thread's own FS meanwhile (see lower_half_fs()).
+  // Otherwise NULL.
+  void *ckpt_fsaddr;
+  void *ckpt_uh_fs;
+  // At restart, DMTCP restores each upper-half fd with dup2() onto its
+  // checkpointed number, which closes any fd that the new lower half already
+  // has at that number (e.g., a UCX socket).  So before MPI_Init,
+  // reserve_restart_fds() dup2()s one memfd onto those numbers: an empty
+  // in-memory file (memfd_create()) with an inode of its own.  DMTCP's
+  // restore replaces the copies that the upper half needs, and
+  // closeReservedFds() closes the others, found by this st_dev and st_ino.
+  // st_ino is 0 if nothing was reserved.
+  unsigned long reserved_fd_dev;
+  unsigned long reserved_fd_ino;
 } LowerHalfInfo_t;
 
-extern LowerHalfInfo_t *lh_info;  
+extern LowerHalfInfo_t *lh_info;
+
+// The FS to enter the lower half with (see JUMP_TO_LOWER_HALF()).  The
+// checkpoint thread gets a TLS of its own, so that it can call MPI while an
+// application thread waits in MPI with the lower half's main TLS.
+static inline unsigned long
+lower_half_fs(unsigned long lh_fs, unsigned long uh_fs)
+{
+  if (__builtin_expect(lh_info->ckpt_uh_fs != NULL, 0) &&
+      (unsigned long)lh_info->ckpt_uh_fs == uh_fs) {
+    return (unsigned long)lh_info->ckpt_fsaddr;
+  }
+  return lh_fs;
+}
 
 #define FOREACH_FNC(MACRO) \
   MACRO(Init) \
@@ -525,20 +553,12 @@ extern LowerHalfInfo_t *lh_info;
 
 #define GENERATE_ENUM(ENUM) MPI_Fnc_##ENUM,
 #define GENERATE_FNC_PTR(FNC) (void*)&MPI_##FNC,
-#define GENERATE_FNC_STRING(FNC)  "MPI_" #FNC
 
 enum MPI_Fncs {
   MPI_Fnc_NULL,
   FOREACH_FNC(GENERATE_ENUM)
   MPI_Fnc_Invalid,
 };
-#ifdef USES_MPI_Fnc_strings
-static const char *MPI_Fnc_strings[] = {
-  "MPI_Fnc_NULL",
-  FOREACH_FNC(GENERATE_FNC_STRING)
-  "MPI_Fnc_Invalid"
-};
-#endif
 
 void* lh_dlsym(enum MPI_Fncs fnc);
 typedef void* (*proxyDlsym_t)(enum MPI_Fncs fnc);

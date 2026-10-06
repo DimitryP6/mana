@@ -3,6 +3,13 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <linux/futex.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -14,6 +21,8 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <algorithm>
+#include <vector>
 
 #include "mtcp_header.h"
 #include "mem-wrapper.h"
@@ -21,6 +30,7 @@
 #include "lower-half-api.h"
 #include "logging.h"
 #include "dmtcp.h"
+#include "protectedfds.h"
 #include "dmtcprestartinternal.h"
 #include "procmapsarea.h"
 // FIXME:  lower-half should be a standalone program, except where it uses
@@ -65,18 +75,24 @@
 #define LOADER_SIZE_LIMIT 0x2000000
 #define MAX_CMD_ARGV2_LENGTH 100
 #define HEAP_GUARD_SIZE 0x1000000
+// Room below the heap guard for the heap of a restarted lower half, which
+// may need a little more than at launch (see restore_heap_break()).
+#define HEAP_SLACK_SIZE 0x1000000
 
 // Lower half initialization helper functions
 void set_addr_no_randomize(char *argv[]);
+static void reserve_restart_fds();
 void create_heap_guard_page();
 void initialize_lh_info();
 void *lh_dlsym(enum MPI_Fncs fnc);
 void write_lh_info_addr(int restore_mode);
+void remove_dangling_env_entries(char **argv);
 
 // Restart Mode helper functions
 int parse_restore_flag(int *argc, char **argv);
 string get_restore_target_info(string restart_dir, int rank);
 void validate_checkpoint_header(RestoreTarget *t, DmtcpCkptHeader &ckpt_hdr);
+void restore_heap_break(void *saved_brk);
 void reserve_memory_areas(RestoreTarget *t, off_t &ckpt_file_pos);
 void *mmap_fixed_noreplace(void *addr, size_t length, int prot, int flags,
                            int fd, off_t offset);
@@ -118,6 +134,47 @@ LowerHalfInfo_t *lh_info;
 
 #define MTCP_RESTART_BINARY "mtcp_restart"
 
+// Created only for an extra lower-half TLS, which the checkpoint thread uses
+// (lh_info->ckpt_fsaddr), because glibc makes a TLS only for a new thread.
+// MPI then sees the checkpoint thread as a second thread while an application
+// thread waits in a blocking call.  This thread never does any work: it
+// reports its FS, then waits forever with all signals blocked.
+static void *
+lh_thread_for_extra_tls(void *arg)
+{
+  unsigned long fs = 0;
+  syscall(SYS_arch_prctl, ARCH_GET_FS, &fs);
+  __atomic_store_n((unsigned long *)arg, fs, __ATOMIC_RELEASE);
+  int never = 0;
+  for (;;) {
+    syscall(SYS_futex, &never, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+  }
+  return NULL;
+}
+
+static void
+create_lh_thread_for_extra_tls()
+{
+  static unsigned long fs = 0;
+  sigset_t all, old;
+  pthread_t thread;
+  pthread_attr_t attr;
+  sigfillset(&all);
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64 * 1024);
+  pthread_sigmask(SIG_SETMASK, &all, &old);
+  int rc = pthread_create(&thread, &attr, lh_thread_for_extra_tls, &fs);
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+  pthread_attr_destroy(&attr);
+  if (rc != 0) {
+    return;
+  }
+  while (__atomic_load_n(&fs, __ATOMIC_ACQUIRE) == 0) {
+    sched_yield();
+  }
+  lh_info->ckpt_fsaddr = (void *)fs;
+}
+
 int main(int argc, char *argv[], char *envp[]) {
   set_addr_no_randomize(argv);
   Elf64_Addr cmd_entry;
@@ -135,9 +192,25 @@ int main(int argc, char *argv[], char *envp[]) {
   lh_info->fsaddr = (void*)fsaddr;
   lh_info->fsgsbase_enabled = CheckAndEnableFsGsBase();
 
-  // Initialize MPI in advance
+  // Initialize MPI in advance.  In blocking mode (MANA_P2P_WAIT=blocking;
+  // mana_restart sets it from the checkpoint), the checkpoint thread's P2P
+  // drain calls MPI while an application thread waits in the library's
+  // MPI_Recv or MPI_Send.  So two threads are in the library at once: this
+  // needs MPI_THREAD_MULTIPLE.  In polling mode no thread waits in the
+  // library during the drain, so the cheaper MPI_THREAD_SINGLE is enough.
   int rank;
-  MPI_Init(&argc, &argv);
+  char **initial_argv = argv;
+  const char *p2p_wait = getenv("MANA_P2P_WAIT");
+  int required = (p2p_wait != NULL && strcmp(p2p_wait, "blocking") == 0)
+                   ? MPI_THREAD_MULTIPLE : MPI_THREAD_SINGLE;
+  int provided = MPI_THREAD_SINGLE;
+  reserve_restart_fds();
+  MPI_Init_thread(&argc, &argv, required, &provided);
+  if (required == MPI_THREAD_MULTIPLE && provided == MPI_THREAD_MULTIPLE) {
+    create_lh_thread_for_extra_tls();
+  }
+  remove_dangling_env_entries(initial_argv);
+  record_lower_half_pid();
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   
   // Initialize MPI Functions and Constants mapping table in lower-half
@@ -179,12 +252,14 @@ int main(int argc, char *argv[], char *envp[]) {
     
     DmtcpCkptHeader ckpt_hdr;
     validate_checkpoint_header(t, ckpt_hdr);
+    restore_heap_break((void *)ckpt_hdr.savedBrk);
     off_t ckpt_file_pos = 0;
     reserve_memory_areas(t, ckpt_file_pos);
     t->initialize();
     release_reserved_memory(t, ckpt_file_pos);
     restore_session_leadership(t);
     restore_memory_data(t, ckpt_hdr);
+    init_mem_arena_after_restore();
     create_heap_guard_page();
     /* Everything restored, close file and finish up */
     close(t->fd());
@@ -195,6 +270,7 @@ int main(int argc, char *argv[], char *envp[]) {
     assert(0);
   } else {
     // LAUNCH MODE:
+    sbrk(HEAP_SLACK_SIZE);
     create_heap_guard_page();
     parse_launch_arguments(argc, argv, &cmd_argc, &cmd_argv);
     // set default loader address
@@ -206,9 +282,8 @@ int main(int argc, char *argv[], char *envp[]) {
       print_usage_and_exit(argv[0]);
     }
 
-    //  Prepend LD_LIBRARY_PATH env variable to
-    //    * '/PATH_TO_MANA/lib/dmtcp' for libmpistub.so (always)
-    //    * '/PATH_TO_MANA/lib/tmp'   for shadow libraries (only when launched with --use-shadowlibs flag)
+    //  Prepend '/PATH_TO_MANA/lib/dmtcp' to LD_LIBRARY_PATH for libmpistub.so,
+    //  and set LD_AUDIT.
     update_library_path(argv[0]);
     get_elf_interpreter(cmd_argv[0], &cmd_entry, elf_interpreter);       
     
@@ -268,6 +343,82 @@ int main(int argc, char *argv[], char *envp[]) {
 #else
 # error "current architecture not supported"
 #endif /* if defined: __i386__ || x86_64 || __aarch64__ || __riscv */
+  }
+}
+
+// At restart, DMTCP dup2()s the upper half's fds onto their checkpointed
+// numbers after the restore, which closes any fd of this lower half at those
+// numbers.  A placeholder keeps each of those numbers (MANA_RESERVED_FDS, set
+// by mana_restart) free of this lower half's fds; the upper half closes the
+// placeholders left over (closeReservedFds()).
+static void reserve_restart_fds() {
+  const char *list = getenv("MANA_RESERVED_FDS");
+  if (list == NULL || *list == '\0') {
+    return;
+  }
+  // DMTCP takes an fd already open at one of its protected numbers for its
+  // own (e.g., jassert_init()), so neither a placeholder nor an fd of this
+  // lower half may be there: keep at least `room` numbers below them free.
+  const int room = 64;
+  std::vector<int> fds;
+  const char *p = list;
+  while (*p != '\0') {
+    char *end;
+    long fd = strtol(p, &end, 10);
+    if (end == p) {
+      break;
+    }
+    if (fd > 2 && (fd < PROTECTED_FD_START || fd > PROTECTED_FD_END) &&
+        fcntl((int)fd, F_GETFD) == -1) {
+      fds.push_back((int)fd);
+    }
+    p = (*end == ',') ? end + 1 : end;
+  }
+  if (fds.empty()) {
+    return;
+  }
+  std::sort(fds.begin(), fds.end());
+  fds.erase(std::unique(fds.begin(), fds.end()), fds.end());
+
+  int free_below = 0;
+  for (int fd = 3; fd < PROTECTED_FD_START; fd++) {
+    if (!std::binary_search(fds.begin(), fds.end(), fd) &&
+        fcntl(fd, F_GETFD) == -1) {
+      free_below++;
+    }
+  }
+  if (free_below < room) {
+    fprintf(stderr, "MANA: WARNING: too many fds were open at checkpoint to "
+            "keep their numbers free at restart; restoring them can close "
+            "fds of the MPI library.\n");
+    return;
+  }
+
+  // dup2() needs each number below the soft RLIMIT_NOFILE: raise it if
+  // needed.  After the restore, DMTCP sets the checkpointed soft limit again
+  // (rlimitfloatenv).
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+      rl.rlim_cur <= (rlim_t)fds.back()) {
+    rlim_t need = (rlim_t)fds.back() + 1 + room;
+    rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max >= need)
+                    ? need : rl.rlim_max;
+    setrlimit(RLIMIT_NOFILE, &rl);
+  }
+
+  // A memfd has an inode of its own, so closeReservedFds() closes only its
+  // copies, not, e.g., the application's fds of /dev/null.
+  int placeholder = memfd_create("mana-reserved-fd", MFD_CLOEXEC);
+  struct stat st;
+  if (placeholder == -1 || fstat(placeholder, &st) == -1) {
+    return;
+  }
+  lh_info->reserved_fd_dev = st.st_dev;
+  lh_info->reserved_fd_ino = st.st_ino;
+  for (int fd : fds) {
+    if (fd != placeholder) {
+      dup2(placeholder, fd);
+    }
   }
 }
 
@@ -489,6 +640,41 @@ void write_lh_info_addr(int restore_mode)
   }
 }
 
+/**
+ * @brief Removes environment entries that point into dead stack memory.
+ *
+ * Some MPI libraries (e.g., Cray MPICH on multi-node runs) putenv() a local
+ *  buffer in MPI_Init().  putenv() doesn't copy the string, so the entry is
+ *  garbage after MPI_Init() returns.  The original environment strings are
+ *  above argv[], so any entry in the main thread's stack below argv[] is
+ *  such a buffer.
+ *
+ * @param argv  The argument vector of main().
+ */
+void remove_dangling_env_entries(char **argv)
+{
+  pthread_attr_t attr;
+  void *stack_addr;
+  size_t stack_size;
+  if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+    return;
+  }
+  pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+  pthread_attr_destroy(&attr);
+
+  int i, j = 0;
+  for (i = 0; __environ[i] != NULL; i++) {
+    char *entry = __environ[i];
+    if (entry >= (char *)stack_addr && entry < (char *)argv) {
+      DLOG(INFO, "Removing environment entry %d at %p: it points into dead"
+           " stack memory\n", i, entry);
+      continue;
+    }
+    __environ[j++] = entry;
+  }
+  __environ[j] = NULL;
+}
+
 
 // -------------------- restart helpers
 /**
@@ -559,6 +745,34 @@ void validate_checkpoint_header(RestoreTarget *t, DmtcpCkptHeader &ckpt_hdr)
   ssize_t rc = read(t->fd(), &ckpt_hdr, sizeof(ckpt_hdr));
   ASSERT_EQ(rc, static_cast<ssize_t>(sizeof(ckpt_hdr)));
   ASSERT_EQ(string(ckpt_hdr.ckptSignature), string(DMTCP_CKPT_SIGNATURE));
+}
+
+/**
+ * @brief Sets the lower half's break to the checkpointed process's break.
+ *
+ * The heap guard and DMTCP's end-of-brk area start at that break and are
+ * restored with the upper half; DMTCP's restoreHeap() then madvise()s the
+ * end-of-brk area away.  So the heap must not reach past that break.  Ending
+ * the heap exactly there keeps the break where the upper half's libc and
+ * DMTCP saw it, and keeps the room left at launch (HEAP_SLACK_SIZE) for the
+ * next restart.
+ *
+ * @param saved_brk The break saved in the checkpoint image's header.
+ */
+void restore_heap_break(void *saved_brk)
+{
+  void *cur_brk = sbrk(0);
+  if (cur_brk > saved_brk) {
+    fprintf(stderr, "MANA: the lower half's heap (break %p) has grown past "
+            "the break of the checkpointed process (%p)\n",
+            cur_brk, saved_brk);
+    exit(1);
+  }
+  if (cur_brk < saved_brk && brk(saved_brk) != 0) {
+    fprintf(stderr, "MANA: cannot move the lower half's break from %p to %p: "
+            "%s\n", cur_brk, saved_brk, strerror(errno));
+    exit(1);
+  }
 }
 
 /**
@@ -808,8 +1022,15 @@ static int restoreMemoryArea(int fd, DmtcpCkptHeader *ckptHdr)
       * are valid.  Can we unmap vdso and vsyscall in Linux?  Used to use
       * mtcp_safemmap here to check for address conflicts.
       */
+      // An area that was not writable is writable here only to be filled
+      // in: don't charge it against the commit limit, which a large
+      // PROT_NONE reservation (the upper half's heap) would exceed.
+      int flags = area.flags;
+      if (!(area.prot & PROT_WRITE)) {
+        flags |= MAP_NORESERVE;
+      }
       mmappedat = restore_mmap(area.addr, area.size, area.prot | PROT_WRITE,
-                               area.flags, imagefd, area.offset);
+                               flags, imagefd, area.offset);
 
       if (mmappedat != area.addr) {
         fprintf(stderr, "restore failed area.addr: %p, area.endAddr%p\n", area.addr, area.endAddr);
@@ -905,22 +1126,24 @@ void print_usage_and_exit(char *prog_name)
 /**
  * @brief Updates the LD_LIBRARY_PATH for the upper-half application.
  *
- * Update LD_LIBRARY_PATH env variable for the Upper-Half(user's MPI application). 
- *  The env variable will be prepended with:
- *  a) location of libmpistub.so library, that contains 
- *      MPI-symbols required for user's MPI application.
- *  b) location of 'shadow-libraries', that cintain sym-link 
- *      for dynamic libraries with constructors.
- *
- * NOTE:  This is necessary when an application is compiled with `mpicc_mana`
- *        instead of `mpicc`, or when shadow libraries are needed for dynamic linking.
+ * Prepends the location of libmpistub.so, which defines the MPI symbols of
+ *  the user's MPI application, to LD_LIBRARY_PATH for the upper half.  It
+ *  also sets LD_AUDIT, so that the upper half loads libmpistub.so in place
+ *  of the MPI library that the application was linked with.
  *
  * @param argv0 the path to the executing binary. 
  */
 void update_library_path(const char *argv0)
 {
-  const char *remove_part = "bin/../bin/lower-half";
-  size_t base_len = strlen(argv0) - strlen(remove_part);
+  // argv0 is <MANA root>/bin/lower-half (mana_launch passes
+  // <MANA root>/bin/../bin/lower-half); otherwise, leave the path alone.
+  const char *remove_part = "bin/lower-half";
+  size_t argv0_len = strlen(argv0);
+  if (argv0_len < strlen(remove_part) ||
+      strcmp(argv0 + argv0_len - strlen(remove_part), remove_part) != 0) {
+    return;
+  }
+  size_t base_len = argv0_len - strlen(remove_part);
 
   // constructing lib1 path: "/path_to_mana/lib/dmtcp"
   const char *lib1_suffix = "lib/dmtcp";
@@ -939,30 +1162,28 @@ void update_library_path(const char *argv0)
     perror("Lib1 prepend to LD_LIBRARY_PATH failed");
     exit(1);
   }
-  free(lib1);
 
-  // constructing lib2 path: "/path_to_mana/lib/tmp"
-  const char *lib2_suffix = "lib/tmp";
-  size_t lib2_len = base_len + strlen(lib2_suffix) + 1;
-  char *lib2 = static_cast<char*>(malloc(lib2_len));
-  if (!lib2) {
-    perror("Malloc for lib2 path failed");
+  // The upper half loads libmpistub.so in place of the MPI library (see
+  // mpi-wrappers/mpi_stub_audit.c).  ld.so ignores LD_AUDIT in
+  // secure-execution mode.  The upper half's ld.so gets the lower half's
+  // AT_SECURE (copy-stack.c copies the auxv), so if the lower half runs
+  // set-user-ID or with file capabilities, the upper half loads the real
+  // MPI library.
+  string audit = string(lib1) + "/libmpistub_audit.so";
+  if (access(audit.c_str(), R_OK) != 0) {
+    fprintf(stderr, "MANA: cannot read %s: %s\n", audit.c_str(),
+            strerror(errno));
     exit(1);
   }
-  strncpy(lib2, argv0, base_len);
-  lib2[base_len] = '\0';
-  strcat(lib2, lib2_suffix);
-
-  // checking if tmp directory for shadow-libs exist
-  struct stat info;
-  if (stat(lib2, &info) == 0) {
-    // prepend lib2 to LD_LIBRARY_PATH
-    if(prepend_to_library_path(lib2) != 0) {
-      perror("");
-      exit(1);
-    }
+  const char *old_audit = getenv("LD_AUDIT");
+  if (old_audit != NULL && old_audit[0] != '\0') {
+    audit = audit + ":" + old_audit;
   }
-  free(lib2);
+  if (setenv("LD_AUDIT", audit.c_str(), 1) != 0) {
+    perror("MANA: setenv(LD_AUDIT) failed");
+    exit(1);
+  }
+  free(lib1);
 }
 
 /**
