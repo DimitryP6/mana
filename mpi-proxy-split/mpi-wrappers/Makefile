@@ -18,7 +18,7 @@ LIBWRAPPER_OBJS = mpi_p2p_wrappers.o mpi_collective_wrappers.o \
                   mpi_unimplemented_wrappers.o mpi_fortran_wrappers.o \
                   mpi_wrappers.o get_fortran_constants.o fortran_constants.o \
                   mpi_win_wrappers.o mpi_file_wrappers.o mpi_error_wrappers.o \
-                  p2p-deterministic.o
+                  p2p-deterministic.o mana_cuda_table.o
 
 
 # Modify if your MANA_ROOT is located elsewhere.
@@ -89,7 +89,7 @@ mpi_collective_wrappers.o: mpi_collective_wrappers.cpp ../virtual_id.h \
 	  DEFINE_mpi_collective_p2p=""; \
 	fi && \
 	${MPICXX} ${CXXFLAGS} -Wall -DDEBUG -fPIC $$DEFINE_mpi_collective_p2p \
-          -I.. -I../lower-half -c $<
+          -I.. -I../lower-half -I$(CUDA_HOME)/include -c $<
 
 # Some of these functions are also collective; e.g., MPI_Win_allocate_shared
 mpi_win_wrappers.o: mpi_win_wrappers.cpp ../virtual_id.h
