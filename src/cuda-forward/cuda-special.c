@@ -5,6 +5,7 @@
  *  - cuGetProcAddress and cuGetExportTable hand out upper-half function
  *    pointers, which the lower half must call through trampolines.
  *  - Host-memory registrations are released before a checkpoint.
+ *  - Buffer ids change on each resume.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -193,6 +194,54 @@ cuMemHostUnregister(void *p)
 }
 
 /*
+ * Pointer attributes.
+ *
+ * CU_POINTER_ATTRIBUTE_BUFFER_ID: on resume, the GPU's checkpoint and
+ * restore may have moved device memory to other physical pages, but the
+ * driver keeps each allocation's buffer id.  The MPI's caches check their
+ * entries by buffer id: libfabric's CUDA monitor keeps NIC registrations, so
+ * after a resume the NIC would still access the old pages.  So the buffer ids
+ * that the lower half sees change on each resume.  (At restart, the lower
+ * half and its caches are new.)
+ */
+static unsigned long long ckpt_generation;  // bumped on each resume
+
+static void
+adjust_attribute(CUpointer_attribute attribute, void *data, CUdeviceptr p)
+{
+  if (data != NULL && attribute == CU_POINTER_ATTRIBUTE_BUFFER_ID) {
+    *(unsigned long long *)data ^= ckpt_generation << 48;
+  }
+}
+
+CUresult
+cuPointerGetAttribute(void *data, CUpointer_attribute attribute,
+                      CUdeviceptr ptr)
+{
+  UPPER(real, cuPointerGetAttribute);
+  CUresult rc;
+  CALL(rc, real(data, attribute, ptr));
+  if (rc == CUDA_SUCCESS) {
+    adjust_attribute(attribute, data, ptr);
+  }
+  return rc;
+}
+
+CUresult
+cuPointerGetAttributes(unsigned int numAttributes,
+                       CUpointer_attribute *attributes, void **data,
+                       CUdeviceptr ptr)
+{
+  UPPER(real, cuPointerGetAttributes);
+  CUresult rc;
+  CALL(rc, real(numAttributes, attributes, data, ptr));
+  for (unsigned i = 0; rc == CUDA_SUCCESS && i < numAttributes; i++) {
+    adjust_attribute(attributes[i], data[i], ptr);
+  }
+  return rc;
+}
+
+/*
  * The checkpoint hooks (FwdCtl).
  */
 static void
@@ -217,6 +266,7 @@ cuda_before_ckpt(void)
 static void
 cuda_after_resume(void)
 {
+  ckpt_generation++;
   int n;
   HostReg *regs = mana_fwd_host_regs(&n);
   for (int i = 0; i < n; i++) {
@@ -247,6 +297,8 @@ own_function(const char *symbol, void *upper_fn)
     { "cuGetExportTable", (void *)cuGetExportTable },
     { "cuMemHostRegister", (void *)cuMemHostRegister_v2 },
     { "cuMemHostUnregister", (void *)cuMemHostUnregister },
+    { "cuPointerGetAttribute", (void *)cuPointerGetAttribute },
+    { "cuPointerGetAttributes", (void *)cuPointerGetAttributes },
   };
   // The two versions of cuGetProcAddress differ in their arguments: the
   // driver's answer tells which one the caller asked for.
