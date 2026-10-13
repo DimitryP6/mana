@@ -141,6 +141,14 @@ mana_cuda_after_resume()
   }
 }
 
+void
+mana_cuda_after_resume_peers()
+{
+  if (mana_cuda_enabled()) {
+    call_in_lower_half(fwd_ctl()->after_resume_peers);
+  }
+}
+
 // A function of the application's CUDA driver, if it has loaded one: this
 // never loads the driver.
 static void *

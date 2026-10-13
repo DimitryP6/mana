@@ -1074,10 +1074,14 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         printEventToStderr("EVENT_RUNNING_AFTER (MPI restored)");
       } else if (g_cuda_resume_pending) {
         // Resume with --cuda: the CUDA plugin has restored the GPU.  Set up
-        // the lower half's CUDA state again.  The threads stay out of the
-        // lower half until then.
+        // the lower half's CUDA state again: first its own, then, once every
+        // rank has exported its memory again, its CUDA IPC mappings of the
+        // other ranks' memory.  The threads stay out of the lower half until
+        // then.
         g_cuda_resume_pending = false;
         mana_cuda_after_resume();
+        dmtcp_global_barrier("MPI:cuda-ipc-exported");
+        mana_cuda_after_resume_peers();
         repostCancelledRecvs();  // p2p_log_replay.cpp
         allow_threads_to_enter_lower_half();
       }

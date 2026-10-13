@@ -46,7 +46,9 @@ gen/cuda.stamp: gen-forward-shim.py $(REAL_LIBCUDA) | gen
 	./gen-forward-shim.py $(REAL_LIBCUDA) libcuda.so.1 cuda gen \
 	  cuGetProcAddress cuGetProcAddress_v2 cuGetExportTable \
 	  cuMemHostRegister cuMemHostRegister_v2 cuMemHostUnregister \
-	  cuPointerGetAttribute cuPointerGetAttributes
+	  cuMemRetainAllocationHandle cuIpcGetMemHandle cuIpcOpenMemHandle \
+	  cuIpcOpenMemHandle_v2 cuIpcCloseMemHandle cuPointerGetAttribute \
+	  cuPointerGetAttributes
 	touch $@
 
 gen/cudart.stamp: gen-forward-shim.py $(REAL_LIBCUDART) | gen
