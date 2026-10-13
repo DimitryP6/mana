@@ -45,7 +45,8 @@ $(OUT)/libmana_fwd.so: fwd-runtime.c fwd-dyn.S fwd-tramp.inc fwd-runtime.h | $(O
 gen/cuda.stamp: gen-forward-shim.py $(REAL_LIBCUDA) | gen
 	./gen-forward-shim.py $(REAL_LIBCUDA) libcuda.so.1 cuda gen \
 	  cuGetProcAddress cuGetProcAddress_v2 cuGetExportTable \
-	  cuMemHostRegister cuMemHostRegister_v2 cuMemHostUnregister
+	  cuMemHostRegister cuMemHostRegister_v2 cuMemHostUnregister \
+	  cuPointerGetAttribute cuPointerGetAttributes
 	touch $@
 
 gen/cudart.stamp: gen-forward-shim.py $(REAL_LIBCUDART) | gen
