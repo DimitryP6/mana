@@ -44,4 +44,9 @@ void mana_cuda_forget_thread(pid_t real_tid);
 void mana_cuda_before_ckpt();
 void mana_cuda_after_resume();
 
+// Makes the CUDA context that owns device buffer 'buf' current on this
+// thread.  The checkpoint thread calls the MPI in the drain and in the
+// restart replay with no context, or another device's.
+void mana_cuda_use_context_of(const void *buf);
+
 #endif  // ifndef _MANA_CUDA_H

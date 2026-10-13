@@ -21,6 +21,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #include "mana_cuda.h"
 #include "cuda-forward/fwd-runtime.h"
@@ -31,6 +32,12 @@
 
 extern "C" pid_t dmtcp_get_real_pid();
 extern "C" pid_t dmtcp_get_real_tid() __attribute((weak));
+
+// From cuda.h, which MANA does not need to build.
+enum {
+  CU_POINTER_ATTRIBUTE_CONTEXT = 1,
+  CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9,
+};
 
 static FwdCtl *
 fwd_ctl()
@@ -129,5 +136,60 @@ mana_cuda_after_resume()
 {
   if (mana_cuda_enabled()) {
     call_in_lower_half(fwd_ctl()->after_resume);
+  }
+}
+
+// A function of the application's CUDA driver, if it has loaded one: this
+// never loads the driver.
+static void *
+driver_sym(const char *symbol)
+{
+  void *cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+  return cuda != NULL ? dlsym(cuda, symbol) : NULL;
+}
+
+typedef int (*attr_fn)(void *, int, unsigned long long);
+
+static attr_fn
+pointer_get_attribute()
+{
+  static attr_fn attr = NULL;
+  static bool looked = false;
+  if (!looked) {
+    attr = (attr_fn)driver_sym("cuPointerGetAttribute");
+    looked = true;
+  }
+  return attr;
+}
+
+void
+mana_cuda_use_context_of(const void *buf)
+{
+  typedef int (*set_fn)(void *);
+  typedef int (*retain_fn)(void **, int);
+  static set_fn set = NULL;
+  static retain_fn retain = NULL;
+  if (!mana_cuda_enabled() || buf == NULL) {
+    return;
+  }
+  attr_fn attr = pointer_get_attribute();
+  if (set == NULL) {
+    set = (set_fn)driver_sym("cuCtxSetCurrent");
+    retain = (retain_fn)driver_sym("cuDevicePrimaryCtxRetain");
+  }
+  if (attr == NULL || set == NULL || retain == NULL) {
+    return;
+  }
+  void *ctx = NULL;
+  int dev = -1;
+  if (attr(&ctx, CU_POINTER_ATTRIBUTE_CONTEXT, (uintptr_t)buf) == 0 &&
+      ctx != NULL) {
+    set(ctx);
+  } else if (attr(&dev, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                  (uintptr_t)buf) == 0 &&
+             retain(&ctx, dev) == 0) {
+    // VMM memory belongs to no context: use its device's primary context,
+    // which the CUDA runtime uses.
+    set(ctx);
   }
 }
