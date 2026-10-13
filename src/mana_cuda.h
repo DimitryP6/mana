@@ -43,6 +43,7 @@ void mana_cuda_forget_thread(pid_t real_tid);
 // Around a checkpoint, on the checkpoint thread: see FwdCtl.
 void mana_cuda_before_ckpt();
 void mana_cuda_after_resume();
+void mana_cuda_after_resume_peers();
 
 // Makes the CUDA context that owns device buffer 'buf' current on this
 // thread.  The checkpoint thread calls the MPI in the drain and in the
