@@ -48,6 +48,14 @@ struct LowerHalfThread {
 extern __thread LowerHalfThread lh_thread ATTR_TLS_INITIAL_EXEC;
 extern bool lower_half_closed;
 
+// With libmana_cuda_vmm.so (mana_launch --cuda): *g_vmm_pending is nonzero
+// while synchronous copies or sets that the application issued may still
+// be running.  The MPI accesses device memory only after a call entered the
+// lower half, so each MPI call first waits for them (g_vmm_drain(); see
+// cuda-forward/vmm-alloc.c).  g_vmm_pending is NULL without that library.
+extern int *g_vmm_pending;
+extern void (*g_vmm_drain)(void);
+
 void init_lower_half_ckpt();
 void register_lower_half_thread();
 void unregister_lower_half_thread();
@@ -72,6 +80,12 @@ lower_half_disable_ckpt()
   if (__builtin_expect(__atomic_load_n(&lower_half_closed, __ATOMIC_RELAXED),
                        0)) {
     wait_until_lower_half_open();
+  }
+  // After the gate: while a checkpoint is in progress, the CUDA plugin
+  // checkpoints and restores the GPU, and CUDA events must not be waited on.
+  if (__builtin_expect(g_vmm_pending != NULL &&
+                       __atomic_load_n(g_vmm_pending, __ATOMIC_ACQUIRE), 0)) {
+    g_vmm_drain();
   }
 }
 

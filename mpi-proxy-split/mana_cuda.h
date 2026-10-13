@@ -53,4 +53,7 @@ void mana_cuda_use_context_of(const void *buf);
 // Whether 'buf' is device memory.
 bool mana_cuda_is_device_memory(const void *buf);
 
+// Connects libmana_cuda_vmm.so, if it is loaded (see lower_half_ckpt.h).
+void mana_cuda_connect_vmm();
+
 #endif  // ifndef _MANA_CUDA_H
