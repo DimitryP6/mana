@@ -36,7 +36,9 @@ extern "C" pid_t dmtcp_get_real_tid() __attribute((weak));
 // From cuda.h, which MANA does not need to build.
 enum {
   CU_POINTER_ATTRIBUTE_CONTEXT = 1,
+  CU_POINTER_ATTRIBUTE_MEMORY_TYPE = 2,
   CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9,
+  CU_MEMORYTYPE_DEVICE = 2,
 };
 
 static FwdCtl *
@@ -192,4 +194,17 @@ mana_cuda_use_context_of(const void *buf)
     // which the CUDA runtime uses.
     set(ctx);
   }
+}
+
+bool
+mana_cuda_is_device_memory(const void *buf)
+{
+  if (!mana_cuda_enabled() || buf == NULL) {
+    return false;
+  }
+  attr_fn attr = pointer_get_attribute();
+  unsigned type = 0;
+  return attr != NULL &&
+         attr(&type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (uintptr_t)buf) == 0 &&
+         type == CU_MEMORYTYPE_DEVICE;
 }

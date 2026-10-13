@@ -49,4 +49,7 @@ void mana_cuda_after_resume();
 // restart replay with no context, or another device's.
 void mana_cuda_use_context_of(const void *buf);
 
+// Whether 'buf' is device memory.
+bool mana_cuda_is_device_memory(const void *buf);
+
 #endif  // ifndef _MANA_CUDA_H

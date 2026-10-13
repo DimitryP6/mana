@@ -204,6 +204,12 @@ void resetDrainCounters();
 // MPI_Isend and MPI_Irecv requests post restart
 extern void replayMpiP2pOnRestart();
 
+// With --cuda: around a checkpoint and resume, cancels the pending
+// MPI_Irecv requests after the drain, and posts them again (see
+// p2p_drain.cpp).
+extern void cancelPendingRecvs();
+extern void repostCancelledRecvs();
+
 // Saves a nonblocking send/recv call in the virtual-ID entry of request 'rq'.
 extern void addPendingRequestToLog(mpi_req_t , const void* , void* , int ,
                                    MPI_Datatype , int , int ,
