@@ -36,10 +36,15 @@ def setup_cuda_forwarding():
   # GDRCopy: memory that the CUDA checkpoint API restored cannot be pinned
   # (gdr_pin_buffer: EINVAL).
   os.environ.setdefault("FI_HMEM_CUDA_USE_GDRCOPY", "0")
-  # A CUDA IPC export of cudaMalloc memory cannot be checkpointed: the MPI
-  # must not use CUDA IPC.
-  os.environ.setdefault("UCX_TLS", "^cuda_ipc")
-  os.environ.setdefault("MPICH_GPU_IPC_ENABLED", "0")   # Cray MPICH
+  # The application's device memory is VMM memory (libmana_cuda_vmm.so),
+  # which the shims share between processes with checkpointable CUDA IPC.
+  # Without the allocator (MANA_CUDA_VMM_ALLOC=0), the MPI must not use CUDA
+  # IPC.
+  if os.environ.get("MANA_CUDA_VMM_ALLOC", "1") == "0":
+    os.environ.setdefault("UCX_TLS", "^cuda_ipc")
+    os.environ.setdefault("MPICH_GPU_IPC_ENABLED", "0")   # Cray MPICH
+  else:
+    os.environ["MANA_CUDA_VMM_ALLOC"] = "1"
 
 dmtcp_flags = sys.argv[1:]
 

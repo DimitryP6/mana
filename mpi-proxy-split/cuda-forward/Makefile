@@ -1,6 +1,7 @@
 # MANA's support of CUDA-aware MPI (mana_launch --cuda); see README.md.
 #   - lh-shims/: the lower half's forwarding shims of libcuda.so.1,
 #     libcudart.so.<N> and libnvidia-ml.so.1, and their runtime libmana_fwd.so;
+#   - libmana_cuda_vmm.so: the upper half's device-memory allocator.
 # 'make install' copies them to $(MANA_ROOT)/lib/dmtcp/.
 
 ifndef MANA_ROOT
@@ -27,12 +28,16 @@ OUT = lh-shims
 SHIMS = $(OUT)/libmana_fwd.so $(OUT)/libcuda.so.1 $(OUT)/$(CUDART_SONAME) \
         $(OUT)/libcudart.so $(OUT)/libnvidia-ml.so.1
 
-default: check-cudart $(SHIMS)
+default: check-cudart $(SHIMS) libmana_cuda_vmm.so
 
 check-cudart:
 	@if [ -z "$(CUDART_SONAME)" ]; then \
 	  echo "cuda-forward: no CUDA runtime found; set REAL_LIBCUDART"; exit 1; \
 	fi
+
+libmana_cuda_vmm.so: vmm-alloc.c
+	$(CC) $(CFLAGS) -shared -o $@ $< -L$(dir $(REAL_LIBCUDA)) -l:libcuda.so.1 \
+	  -ldl -lpthread
 
 $(OUT) gen:
 	mkdir -p $@
@@ -98,8 +103,9 @@ install: default
 	mkdir -p $(MANA_ROOT)/lib/dmtcp/cuda-forward
 	rm -f $(MANA_ROOT)/lib/dmtcp/cuda-forward/libcudart.so*
 	cp -df $(OUT)/* $(MANA_ROOT)/lib/dmtcp/cuda-forward/
+	cp -f libmana_cuda_vmm.so $(MANA_ROOT)/lib/dmtcp/
 
 clean:
-	rm -rf $(OUT) gen test-fwd
+	rm -rf $(OUT) gen libmana_cuda_vmm.so test-fwd
 
 .PHONY: default check-cudart check install clean
