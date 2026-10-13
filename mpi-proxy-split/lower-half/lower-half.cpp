@@ -40,6 +40,7 @@
 #include "jconvert.h"
 #include "jfilesystem.h"
 #include "util.h"
+#include "cuda-forward/fwd-runtime.h"
 
 // kernel-loader.tgz (Gene Cooperman, gene@ccs.neu.edu) has upstream source
 // for many files in this dir.  This file is kernel-loader.c at upstream.
@@ -175,6 +176,97 @@ create_lh_thread_for_extra_tls()
   lh_info->ckpt_fsaddr = (void *)fs;
 }
 
+// Initializes MPI.  In blocking mode (MANA_P2P_WAIT=blocking; mana_restart
+// sets it from the checkpoint), the checkpoint thread's P2P drain calls MPI
+// while an application thread waits in the library's MPI_Recv or MPI_Send.
+// So two threads are in the library at once: this needs MPI_THREAD_MULTIPLE.
+// In polling mode no thread waits in the library during the drain, so the
+// cheaper MPI_THREAD_SINGLE is enough.
+static void
+init_lh_mpi(int *argc, char ***argv)
+{
+  const char *p2p_wait = getenv("MANA_P2P_WAIT");
+  int required = (p2p_wait != NULL && strcmp(p2p_wait, "blocking") == 0)
+                   ? MPI_THREAD_MULTIPLE : MPI_THREAD_SINGLE;
+  int provided = MPI_THREAD_SINGLE;
+  MPI_Init_thread(argc, argv, required, &provided);
+  if (required == MPI_THREAD_MULTIPLE && provided == MPI_THREAD_MULTIPLE) {
+    create_lh_thread_for_extra_tls();
+  }
+}
+
+// The rank in MPI_COMM_WORLD as the launcher tells it, or -1.
+static int
+launcher_rank()
+{
+  const char *vars[] = { "PMI_RANK", "PMIX_RANK", "SLURM_PROCID",
+                         "OMPI_COMM_WORLD_RANK", "MV2_COMM_WORLD_RANK" };
+  for (const char *var : vars) {
+    const char *value = getenv(var);
+    if (value != NULL && value[0] != '\0') {
+      return atoi(value);
+    }
+  }
+  return -1;
+}
+
+// With --cuda (MANA_CUDA_FORWARD), the upper half calls this from the
+// application's MPI_Init(), and at restart once the GPU is restored
+// (lh_info->lh_mpi_init).
+static void
+lazy_lh_mpi_init()
+{
+  static int done = 0;
+  if (!done) {
+    done = 1;
+    init_lh_mpi(NULL, NULL);
+  }
+}
+
+// --cuda: the lower half's libcuda.so.1, libcudart.so.<N> and
+// libnvidia-ml.so.1 are forwarding shims to the upper half's libraries
+// (cuda-forward/README.md).  mana_launch puts their directory first in
+// LD_LIBRARY_PATH.  Loads their runtime and passes it to the upper half.
+static void
+load_cuda_shims()
+{
+  void *fwd = dlopen("libmana_fwd.so", RTLD_NOW | RTLD_GLOBAL);
+  if (fwd == NULL) {
+    fprintf(stderr, "MANA: --cuda: %s\n", dlerror());
+    exit(1);
+  }
+  FwdCtl *(*get_ctl)(void) = (FwdCtl *(*)(void))dlsym(fwd, "mana_fwd_get_ctl");
+  FwdCtl *ctl = get_ctl();
+  *ctl->fsgsbase = lh_info->fsgsbase_enabled;
+  lh_info->fwd_ctl = ctl;
+}
+
+// Takes directory 'dir' out of LD_LIBRARY_PATH.  ld.so read LD_LIBRARY_PATH
+// when the lower half started; the upper half's ld.so reads it again.
+static void
+remove_from_library_path(const char *dir)
+{
+  const char *path = getenv("LD_LIBRARY_PATH");
+  if (path == NULL) {
+    return;
+  }
+  string kept;
+  string all = path;
+  size_t start = 0;
+  while (start <= all.size()) {
+    size_t end = all.find(':', start);
+    if (end == string::npos) {
+      end = all.size();
+    }
+    string entry = all.substr(start, end - start);
+    if (!entry.empty() && entry != dir) {
+      kept += (kept.empty() ? "" : ":") + entry;
+    }
+    start = end + 1;
+  }
+  setenv("LD_LIBRARY_PATH", kept.c_str(), 1);
+}
+
 int main(int argc, char *argv[], char *envp[]) {
   set_addr_no_randomize(argv);
   Elf64_Addr cmd_entry;
@@ -192,33 +284,47 @@ int main(int argc, char *argv[], char *envp[]) {
   lh_info->fsaddr = (void*)fsaddr;
   lh_info->fsgsbase_enabled = CheckAndEnableFsGsBase();
 
-  // Initialize MPI in advance.  In blocking mode (MANA_P2P_WAIT=blocking;
-  // mana_restart sets it from the checkpoint), the checkpoint thread's P2P
-  // drain calls MPI while an application thread waits in the library's
-  // MPI_Recv or MPI_Send.  So two threads are in the library at once: this
-  // needs MPI_THREAD_MULTIPLE.  In polling mode no thread waits in the
-  // library during the drain, so the cheaper MPI_THREAD_SINGLE is enough.
-  int rank;
-  char **initial_argv = argv;
-  const char *p2p_wait = getenv("MANA_P2P_WAIT");
-  int required = (p2p_wait != NULL && strcmp(p2p_wait, "blocking") == 0)
-                   ? MPI_THREAD_MULTIPLE : MPI_THREAD_SINGLE;
-  int provided = MPI_THREAD_SINGLE;
-  reserve_restart_fds();
-  MPI_Init_thread(&argc, &argv, required, &provided);
-  if (required == MPI_THREAD_MULTIPLE && provided == MPI_THREAD_MULTIPLE) {
-    create_lh_thread_for_extra_tls();
+  int restore_mode = parse_restore_flag(&argc, argv);
+
+  // With --cuda, MPI_Init() must wait until the application's CUDA is
+  // there: the MPI's CUDA calls go to it.  At launch, that is the
+  // application's MPI_Init(); at restart, after the CUDA plugin restored the
+  // GPU.  The rank, which picks the checkpoint image, then comes from the
+  // launcher.
+  int lazy_mpi_init = 0;
+  if (getenv("MANA_CUDA_FORWARD") != NULL) {
+    load_cuda_shims();
+    lazy_mpi_init = !restore_mode || launcher_rank() >= 0;
   }
-  remove_dangling_env_entries(initial_argv);
+
+  int rank = -1;
+  char **initial_argv = argv;
+  if (lazy_mpi_init) {
+    // MPI_Init() runs after the upper half's fds are restored: no fd
+    // numbers to reserve (reserve_restart_fds()).
+    lh_info->lh_mpi_init = (void*)&lazy_lh_mpi_init;
+  } else {
+    reserve_restart_fds();
+    init_lh_mpi(&argc, &argv);
+    remove_dangling_env_entries(initial_argv);
+  }
+  // MANA_LH_ONLY_LIBRARY_PATH: the shims' directory, for the lower half only.
+  const char *lh_only = getenv("MANA_LH_ONLY_LIBRARY_PATH");
+  if (lh_only != NULL) {
+    remove_from_library_path(lh_only);
+  }
   record_lower_half_pid();
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  
+  if (!lazy_mpi_init) {
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  } else if (restore_mode) {
+    rank = launcher_rank();
+  }
+
   // Initialize MPI Functions and Constants mapping table in lower-half
   initialize_lh_info();
 
-  // Check arguments and setup arguments for the loader program (cmd)
-  // if has "--restore", pass all arguments to mtcp_restart
-  int restore_mode = parse_restore_flag(&argc, argv);
+  // Setup arguments for the loader program (cmd); with "--restore"
+  // (parse_restore_flag(), above), pass all arguments to mtcp_restart.
   write_lh_info_addr(restore_mode);
   
   if (restore_mode) {

@@ -36,7 +36,7 @@ LH_SRCDIR=lower-half
 
 # As you add new files to your plugin library, add the object file names here.
 
-LIBOBJS = uh_wrappers.o mpi_plugin.o p2p_drain_send_recv.o p2p_log_replay.o \
+LIBOBJS = uh_wrappers.o mana_cuda.o mpi_plugin.o p2p_drain_send_recv.o p2p_log_replay.o \
           seq_num.o virtual_id.o lower_half_ckpt.o \
           lower-half/switch-context.o \
 
