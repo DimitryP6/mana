@@ -79,6 +79,12 @@ install: all
 	$(INSTALL_SCRIPT) $(MANA_SCRIPTS:%=scripts/%) $(DESTDIR)$(bindir)
 	$(INSTALL_PROGRAM) bin/lower-half $(DESTDIR)$(bindir)
 	$(INSTALL_PROGRAM) $(MANA_LIBS:%=lib/dmtcp/%) $(DESTDIR)$(pkglibdir)
+	@ # CUDA-aware MPI (mana_launch --cuda), if it was built.
+	if [ -d lib/dmtcp/cuda-forward ]; then \
+	  $(INSTALL) -d $(DESTDIR)$(pkglibdir)/cuda-forward && \
+	  cp -df lib/dmtcp/cuda-forward/* $(DESTDIR)$(pkglibdir)/cuda-forward/ && \
+	  $(INSTALL_PROGRAM) lib/dmtcp/libdmtcp_cuda.so $(DESTDIR)$(pkglibdir); \
+	fi
 	cd manpages && $(MAKE) DESTDIR=$(DESTDIR) $(INSTALL_FLAGS)
 
 # In the reverse order of 'install'.  Quote each path: a space in it must
@@ -87,6 +93,8 @@ uninstall:
 	cd manpages && $(MAKE) DESTDIR=$(DESTDIR) $(UNINSTALL_FLAGS)
 	for f in $(MANA_SCRIPTS) lower-half; do rm -f "$(DESTDIR)$(bindir)/$$f"; done
 	for f in $(MANA_LIBS); do rm -f "$(DESTDIR)$(pkglibdir)/$$f"; done
+	rm -f "$(DESTDIR)$(pkglibdir)/libdmtcp_cuda.so"
+	rm -rf "$(DESTDIR)$(pkglibdir)/cuda-forward"
 	cd ${DMTCP_ROOT} && $(MAKE) DESTDIR=$(DESTDIR) $(UNINSTALL_FLAGS)
 
 distclean: clean

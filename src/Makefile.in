@@ -17,6 +17,11 @@ override CXXFLAGS += -fno-stack-protector
 #   libmpistub_audit.so
 
 # Subdirectories needed to stage
+# CUDA-aware MPI (mana_launch --cuda; cuda-forward/README.md) is built if
+# there are cuda.h and libcuda.so.1.
+CUDA_HOME ?= $(shell d=$$(dirname $$(command -v nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc))/..; echo $$d)
+HAVE_CUDA = $(and $(wildcard $(CUDA_HOME)/include/cuda.h),$(shell /sbin/ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1 ' && echo yes))
+
 LOWER_HALF_SRCDIR=lower-half
 WRAPPERS_SRCDIR=mpi-wrappers
 
@@ -95,6 +100,12 @@ stage:
 	$(MAKE) ${MANA_ROOT}/lib/dmtcp/libmpistub.so
 	$(MAKE) ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so
 	$(MAKE) -C ${LOWER_HALF_SRCDIR} stage
+	@ # CUDA-aware MPI (mana_launch --cuda): with a CUDA toolkit and driver.
+	if [ -n "$(HAVE_CUDA)" ]; then \
+	  $(MAKE) -C cuda-forward CUDA_HOME=$(CUDA_HOME) stage && \
+	  $(MAKE) -C ${DMTCP_ROOT}/plugin/cuda libdmtcp_cuda.so && \
+	  cp -f ${DMTCP_ROOT}/plugin/cuda/libdmtcp_cuda.so ${MANA_ROOT}/lib/dmtcp/; \
+	fi
 
 tidy:
 	rm -f *~ .*.swp dmtcp_restart_script*.sh ckpt_*.dmtcp
@@ -102,6 +113,7 @@ tidy:
 	rm -rf dmtcp_coordinator_db-*.json
 
 clean: tidy
+	- $(MAKE) -C cuda-forward clean
 	rm -f ${LIBOBJS} *.d
 	rm -f libmana.so
 	rm -f ${MANA_ROOT}/lib/dmtcp/libmana.so
