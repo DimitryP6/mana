@@ -45,11 +45,14 @@ class Test:
   burst:       checkpoints in a row per cycle, without waiting for progress.
   restart_now: restart right after the checkpoints, without waiting for
                progress.
+  cuda:        a CUDA-aware MPI test: runs with MANA_CUDA=1 (mana_launch
+               --cuda); skipped without a GPU or if it was not built.
   """
 
   def __init__(self, name, ranks, args=(), kind="loop", expect=None,
                restart=False, fails=False, known_bug=None, native_args=None,
-               program=None, burst=1, restart_now=False):
+               program=None, burst=1, restart_now=False,
+               cuda=False):
     self.name = name
     self.ranks = ranks
     self.args = list(args)
@@ -58,6 +61,7 @@ class Test:
     self.restart = restart
     self.fails = fails
     self.known_bug = known_bug
+    self.cuda = cuda
     # The program, relative to this directory.
     self.program = program or name
     # Arguments for a native run of kind "run".
@@ -121,6 +125,7 @@ TESTS = [
   Test("finalize_unsync", 4, args=["8"], kind="run", restart=True,
        native_args=["1"]),
   Test("abort", 2, kind="run", fails=True, expect="abort: calling MPI_Abort"),
+  Test("cuda_aware", 2, cuda=True),
   Test("dlopen_mpi", 2, args=[MPI_LIBRARY, "8"], kind="run", restart=True,
        native_args=[MPI_LIBRARY, "1"]),
   # The example that the documentation uses, as its users run it.
@@ -198,6 +203,8 @@ class Run:
       # DMTCP writes its error messages here when stderr is not a file.
       "JALIB_STDERR_PATH": os.path.join(self.dir, "dmtcp-errors.log"),
     })
+    if test.cuda and not opts.native:
+      self.env["MANA_CUDA"] = "1"
     self.proc = None
     self.logs = []
 
@@ -466,8 +473,23 @@ def mpi_library():
   return m.group(1)
 
 
+def cuda_skip_reason(test):
+  """Why a CUDA test cannot run here, or None."""
+  if not os.path.exists(os.path.join(TEST_DIR, test.program)):
+    return "not built (no nvcc?)"
+  # The device files, not nvidia-smi: NVML refuses to run when the driver's
+  # library and kernel module differ in version, but CUDA still runs.
+  if not glob.glob("/dev/nvidia[0-9]*"):
+    return "no GPU"
+  return None
+
+
 def run_test(test, opts):
   """Runs one test; returns (passed, text of the result)."""
+  if test.cuda:
+    skip = cuda_skip_reason(test)
+    if skip is not None:
+      return True, "SKIPPED (%s)" % skip, ""
   steps = []
   shm_before = shm_files()
   run = Run(test, opts)

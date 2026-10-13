@@ -27,7 +27,7 @@ WRAPPERS_SRCDIR=mpi-wrappers
 
 # As you add new files to your plugin library, add the object file names here.
 
-LIBOBJS = uh_wrappers.o mpi_plugin.o p2p_drain.o \
+LIBOBJS = uh_wrappers.o mana_cuda.o mpi_plugin.o p2p_drain.o \
           seq_num.o virtual_id.o lower_half_ckpt.o \
           lower-half/switch-context.o \
 

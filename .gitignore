@@ -43,6 +43,7 @@ __pycache__/
 /test/*
 !/test/*.c
 !/test/*.cpp
+!/test/*.cu
 !/test/*.f90
 !/test/*.h
 !/test/*.py

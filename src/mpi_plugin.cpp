@@ -47,6 +47,7 @@
 #include "mpi_nextfunc.h"
 #include "virtual_id.h"
 #include "uh_wrappers.h"
+#include "mana_cuda.h"
 
 #include "config.h"
 #include "dmtcp.h"
@@ -777,6 +778,39 @@ updateCkptDirByRank()
   dmtcp_set_ckpt_dir(o.str().c_str());
 }
 
+// With --cuda (mana_cuda.h): the lower half's CUDA state was taken down
+// for a checkpoint, and must be set up again on resume.
+static bool g_cuda_resume_pending = false;
+// With --cuda: at restart, the MPI state is restored in RUNNING_AFTER_*.
+static bool g_restart_mpi_deferred = false;
+
+// The MPI part of restart: virtual ids, the logged MPI state, the drained
+// messages, MPI files.
+static void
+restore_mpi_state_on_restart()
+{
+  dmtcp_local_barrier("MPI:updateEnviron");
+  seq_num_reset();
+  dmtcp_local_barrier("MPI:seq_num_reset");
+  init_predefined_virt_ids();
+  check_tag_ub();
+  reconstruct_descriptors();
+  dmtcp_local_barrier("MPI:Reset-Drain-Send-Recv-Counters");
+  resetDrainCounters(); // p2p_drain.cpp
+  char str[1];
+  MPI_MANA_Internal(str); // This does nothing.  Modify in lower-half
+                         // for easy debugging of lower half during restart.
+                         // See definition in mpi-wrappers/mpi_wrappers.cpp
+  dmtcp_global_barrier("MPI:replayMpiP2pOnRestart");
+  replayMpiP2pOnRestart(); // p2p_drain.cpp
+  sendOwedSsendAcks(); // p2p_drain.cpp
+  dmtcp_local_barrier("MPI:p2p_log_replay.cpp-void");
+  const char *file = get_mpi_file_filename();
+  restore_mpi_files(file);
+  dmtcp_local_barrier("MPI:Restore-MPI-Files");
+  mana_state = RUNNING;
+}
+
 static void
 mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 {
@@ -800,6 +834,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       pid_t real_tid = dmtcp_get_real_tid();
       unsigned long fs = getFS();
       g_upper_half_fsbase->insert(std::make_pair(real_tid, fs));
+      mana_cuda_note_thread(real_tid, fs);
 
       if (g_file_flags_map != NULL) {
         delete g_file_flags_map;
@@ -854,6 +889,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       unsigned long fs = getFS();
       g_upper_half_fsbase->insert(std::make_pair(real_tid, fs));
       DmtcpMutexUnlock(&g_upper_half_fsbase_lock);
+      mana_cuda_note_thread(real_tid, fs);
       break;
     }
 
@@ -865,6 +901,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       pid_t real_tid = dmtcp_get_real_tid();
       g_upper_half_fsbase->erase(real_tid);
       DmtcpMutexUnlock(&g_upper_half_fsbase_lock);
+      mana_cuda_forget_thread(real_tid);
       break;
     }
 
@@ -876,6 +913,8 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       while (!__atomic_load_n(&g_libmpi_is_initialized, __ATOMIC_ACQUIRE)) {
         usleep(1000);
       }
+      // The drain calls MPI, and so the MPI's CUDA, on this thread.
+      mana_cuda_note_thread(dmtcp_get_real_tid(), getFS());
       resetDrainStats();  // p2p_drain.cpp
       uint64_t t0 = drainStatsNow();
       mana_state = CKPT_COLLECTIVE;
@@ -920,6 +959,13 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       }
       complete_comm_free_barriers();  // seq_num.cpp
       reportDrainStats();  // With MANA_DRAIN_STATS set
+      // No message is in flight now.  Next, the CUDA plugin checkpoints the
+      // GPU (its PRESUSPEND runs after ours).  The lower half's CUDA state
+      // must not be in the checkpoint.
+      if (mana_cuda_enabled()) {
+        mana_cuda_before_ckpt();
+        g_cuda_resume_pending = true;
+      }
       printEventToStderr("EVENT_PRESUSPEND (done)");
       break;
     }
@@ -927,8 +973,11 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
     case DMTCP_EVENT_PRECHECKPOINT: {
       printEventToStderr("EVENT_PRECHECKPOINT (drain send/recv)");
       // The threads are suspended now; let them back into the lower half
-      // when they resume.
-      allow_threads_to_enter_lower_half();
+      // when they resume.  With --cuda, only after the lower half's CUDA
+      // state is back, in RUNNING_AFTER_*.
+      if (!mana_cuda_enabled()) {
+        allow_threads_to_enter_lower_half();
+      }
       recordOpenFds();
       dmtcp_local_barrier("MPI:GetLocalRankInfo");
       getLocalRankInfo();
@@ -972,28 +1021,47 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
       g_upper_half_fsbase->clear();
       g_upper_half_fsbase->insert(std::make_pair(dmtcp_get_real_tid(), getFS()));
-
-      dmtcp_local_barrier("MPI:updateEnviron");
-      seq_num_reset();
-      dmtcp_local_barrier("MPI:seq_num_reset");
-      init_predefined_virt_ids();
-      check_tag_ub();
-      reconstruct_descriptors();
-      dmtcp_local_barrier("MPI:Reset-Drain-Send-Recv-Counters");
-      resetDrainCounters(); // p2p_drain.cpp
-      char str[1];
-      MPI_MANA_Internal(str); // This does nothing.  Modify in lower-half
-                             // for easy debugging of lower half during restart.
-                             // See definition in mpi-wrappers/mpi_wrappers.cpp
-      dmtcp_global_barrier("MPI:replayMpiP2pOnRestart");
-      replayMpiP2pOnRestart(); // p2p_drain.cpp
-      sendOwedSsendAcks(); // p2p_drain.cpp
-      dmtcp_local_barrier("MPI:p2p_log_replay.cpp-void");
-      const char *file = get_mpi_file_filename();
-      restore_mpi_files(file);
-      dmtcp_local_barrier("MPI:Restore-MPI-Files");
-      mana_state = RUNNING;
+      mana_cuda_note_thread(dmtcp_get_real_tid(), getFS());
+      if (mana_cuda_enabled()) {
+        // The MPI uses the application's CUDA, which the CUDA plugin
+        // restores in its RUNNING: the restore needs the threads running.
+        // DMTCP raises RUNNING_AFTER_RESUME and _RESTART after every
+        // plugin's RUNNING, so initialize MPI and restore the MPI state
+        // there.  The threads stay out of the lower half until then.
+        g_restart_mpi_deferred = true;
+        wait_for_threads_to_leave_lower_half();  // lower_half_ckpt.cpp
+        printEventToStderr("EVENT_RESTART (MPI deferred)");
+        break;
+      }
+      restore_mpi_state_on_restart();
       printEventToStderr("EVENT_RESTART (done)");
+      break;
+    }
+
+    // After every plugin's RUNNING, in which the CUDA plugin restores the
+    // GPU.  DMTCP raises both events each time the threads run (after
+    // launch, resume and restart): the flags tell what is left to do, so the
+    // second one finds nothing.
+    case DMTCP_EVENT_RUNNING_AFTER_RESUME:
+    case DMTCP_EVENT_RUNNING_AFTER_RESTART: {
+      if (g_restart_mpi_deferred) {
+        // Restart with --cuda: see DMTCP_EVENT_RESTART.  The CUDA plugin
+        // has restored the GPU.
+        g_restart_mpi_deferred = false;
+        g_cuda_resume_pending = false;
+        wait_for_threads_to_leave_lower_half();
+        mana_lower_half_mpi_init();
+        restore_mpi_state_on_restart();
+        allow_threads_to_enter_lower_half();
+        printEventToStderr("EVENT_RUNNING_AFTER (MPI restored)");
+      } else if (g_cuda_resume_pending) {
+        // Resume with --cuda: the CUDA plugin has restored the GPU.  Set up
+        // the lower half's CUDA state again.  The threads stay out of the
+        // lower half until then.
+        g_cuda_resume_pending = false;
+        mana_cuda_after_resume();
+        allow_threads_to_enter_lower_half();
+      }
       break;
     }
 
@@ -1007,6 +1075,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       DmtcpMutexLock(&g_upper_half_fsbase_lock);
       g_upper_half_fsbase->insert(std::make_pair(dmtcp_get_real_tid(), getFS()));
       DmtcpMutexUnlock(&g_upper_half_fsbase_lock);
+      mana_cuda_note_thread(dmtcp_get_real_tid(), getFS());
       break;
     }
 
