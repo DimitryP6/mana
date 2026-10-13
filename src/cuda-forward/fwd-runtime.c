@@ -504,12 +504,20 @@ fwd_after_resume_peers(void)
   }
 }
 
+static int
+fwd_forwarding(unsigned long sp)
+{
+  FwdThread *t = current_thread(sp, 0);
+  return t != NULL && t->depth > 0;
+}
+
 __attribute__((constructor)) static void
 fwd_runtime_init(void)
 {
   mana_fwd_ctl.fsgsbase = &mana_fwd_fsgsbase;
   mana_fwd_ctl.register_thread = fwd_register_thread;
   mana_fwd_ctl.forget_thread = fwd_forget_thread;
+  mana_fwd_ctl.forwarding = fwd_forwarding;
   mana_fwd_ctl.before_ckpt = fwd_before_ckpt;
   mana_fwd_ctl.after_resume = fwd_after_resume;
   mana_fwd_ctl.after_resume_peers = fwd_after_resume_peers;

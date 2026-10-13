@@ -41,6 +41,9 @@ typedef struct {
   void (*register_thread)(int tid, unsigned long uhfs, unsigned long lo,
                           unsigned long hi);
   void (*forget_thread)(int tid);
+  // Whether the thread whose stack holds 'sp' is in a call that the lower
+  // half (the MPI library) made through the shims.
+  int (*forwarding)(unsigned long sp);
   // Called on the checkpoint thread, with the lower half's FS: before the
   // CUDA plugin checkpoints the GPU, and after it restored the GPU on
   // resume.  The lower half's CUDA state that refers to its own memory

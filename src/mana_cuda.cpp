@@ -27,6 +27,7 @@
 #include "cuda-forward/fwd-runtime.h"
 #include "dmtcp.h"
 #include "lower-half-api.h"
+#include "lower_half_ckpt.h"
 #include "switch-context.h"
 #include "uh_wrappers.h"
 
@@ -215,4 +216,29 @@ mana_cuda_is_device_memory(const void *buf)
   return attr != NULL &&
          attr(&type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (uintptr_t)buf) == 0 &&
          type == CU_MEMORYTYPE_DEVICE;
+}
+
+// For libmana_cuda_vmm.so: whether this thread is in a CUDA call that the
+// MPI library made through the shims.
+static int
+forwarding()
+{
+  FwdCtl *ctl = fwd_ctl();
+  return ctl != NULL &&
+         ctl->forwarding((unsigned long)__builtin_frame_address(0));
+}
+
+void
+mana_cuda_connect_vmm()
+{
+  typedef void (*connect_fn)(int (*)(void));
+  connect_fn connect = (connect_fn)dlsym(RTLD_DEFAULT, "mana_vmm_connect");
+  int *pending = (int *)dlsym(RTLD_DEFAULT, "mana_vmm_pending");
+  void (*drain)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "mana_vmm_drain");
+  if (connect == NULL || pending == NULL || drain == NULL) {
+    return;
+  }
+  g_vmm_drain = drain;
+  __atomic_store_n(&g_vmm_pending, pending, __ATOMIC_RELEASE);
+  connect(forwarding);
 }
