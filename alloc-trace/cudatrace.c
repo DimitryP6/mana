@@ -37,12 +37,13 @@ now_ns(void)
   return ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
-// Basename of the first object on the stack that is not CUDA or this library.
+// Basename of the first object on the stack that is not CUDA, this library,
+// or UCX's memory hooks (libucm wraps cudaMalloc for whole processes).
 static const char *
 caller(void)
 {
   static const char *skip[] = { "libcuda.", "libcudart", "libcupti",
-                                "libcudatrace", NULL };
+                                "libcudatrace", "libucm", NULL };
   void *pc[24];
   int n = backtrace(pc, 24);
   for (int i = 1; i < n; i++) {
