@@ -11,9 +11,12 @@
  * cuMemAllocPitch_v2 and cuMemFree_v2 become cuMemCreate (shareable as a
  * POSIX fd), cuMemAddressReserve and cuMemMap (see redirect()).
  *
- * Small allocations are carved out of VMM chunks of the allocation
- * granularity (2 MB), first fit, 512-byte aligned.  An IPC export then shares
- * the whole chunk: cuMemGetAddressRange reports the chunk, as UCX expects.
+ * Allocations below MANA_VMM_SMALL_LIMIT (1 MB) are carved out of VMM chunks
+ * of MANA_VMM_CHUNK_SIZE (the allocation granularity, 2 MB), best fit,
+ * 512-byte aligned; one empty chunk per device stays for the next ones.  An
+ * IPC export then shares the whole chunk: cuMemGetAddressRange reports the
+ * chunk, as UCX expects.  Larger allocations get a VMM allocation of their
+ * own.
  *
  * VMM memory lacks two orderings of cudaMalloc memory, which the library
  * keeps: cudaFree waits for the device's work (wrap_free()), and the
@@ -33,12 +36,12 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "pool.h"
 
 #define ALIGN 512
-#define SMALL_LIMIT (1 << 20)     // smaller ones are carved out of chunks
 #define MAX_ALLOCS 65536
 #define MAX_CHUNKS 4096
-#define MAX_BLOCKS 64             // per chunk
+#define MAX_DEVICES 64
 
 typedef CUresult (*alloc_fn)(CUdeviceptr *, size_t);
 typedef CUresult (*pitch_fn)(CUdeviceptr *, size_t *, size_t, size_t, unsigned);
@@ -54,6 +57,7 @@ static CUresult (*stream_sync)(CUstream);
 typedef struct {                  // A VMM allocation of its own.
   CUdeviceptr base;
   size_t size;
+  size_t asked;
   CUmemGenericAllocationHandle h;
   int on;
 } Alloc;
@@ -71,12 +75,15 @@ typedef struct {                  // A VMM chunk for small allocations.
 
 static Alloc allocs[MAX_ALLOCS];
 static int n_allocs;
-static Chunk chunks[MAX_CHUNKS];
-static int n_chunks;
+static Pool pool;                 // of the small allocations; see sizes()
+static size_t small_limit;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int verbose;
 static struct {
   unsigned long vmm, small, fallback, frees, deferred, immediate, drained;
+  // Bytes of large allocations as requested and as allocated, now and at the
+  // peak (the pool counts the small ones).
+  size_t large_asked, large_held, large_asked_max, large_held_max;
 } stats;
 
 // Whether VMM memory of 'dev' can be made GPUDirect RDMA capable.  A NIC
@@ -170,106 +177,98 @@ granularity(void)
   return g;
 }
 
-// First fit in the chunks of the current device.
+// A size from the environment, in bytes or with a K, M or G suffix; 'dflt' if
+// unset or invalid.
+static size_t
+env_size(const char *name, size_t dflt)
+{
+  const char *s = getenv(name);
+  char *end;
+  if (s == NULL) {
+    return dflt;
+  }
+  unsigned long long n = strtoull(s, &end, 0);
+  switch (*end) {
+  case 'G': case 'g': n <<= 10;  // fall through
+  case 'M': case 'm': n <<= 10;  // fall through
+  case 'K': case 'k': n <<= 10; end++; break;
+  }
+  return end == s || *end != '\0' ? dflt : (size_t)n;
+}
+
+// The pool's chunks: VMM allocations of the current context's device, which
+// is 'dev'.
+static int
+chunk_new(int dev, size_t size, uint64_t *base, uint64_t *h)
+{
+  (void)dev;
+  CUdeviceptr b;
+  CUmemGenericAllocationHandle hh;
+  CUresult rc = vmm_create(size, &b, &hh, NULL);
+  if (rc == CUDA_SUCCESS) {
+    *base = b;
+    *h = hh;
+  }
+  return rc;
+}
+
+static void
+chunk_free(uint64_t base, size_t size, uint64_t h)
+{
+  vmm_destroy(base, size, h);
+}
+
+// The pool, at the first allocation (the granularity needs a context): its
+// chunk size (a multiple of the granularity) and the limit below which
+// allocations go to it (at most half a chunk, so that a chunk holds several).
+static void
+sizes(void)
+{
+  if (pool.ready) {
+    return;
+  }
+  size_t g = granularity();
+  size_t c = env_size("MANA_VMM_CHUNK_SIZE", g);
+  c = c > g ? (c + g - 1) / g * g : g;
+  small_limit = env_size("MANA_VMM_SMALL_LIMIT", 1 << 20);
+  if (small_limit > c / 2) {
+    small_limit = c / 2;
+  }
+  pool_init(&pool, c, chunk_new, chunk_free, CUDA_ERROR_OUT_OF_MEMORY);
+}
+
+// Adds 'n' bytes to a count of 'stats' and its peak.  With the lock.
+static void
+count(size_t *now, size_t *max, size_t n)
+{
+  *now += n;
+  if (*now > *max) {
+    *max = *now;
+  }
+}
+
+// A small allocation from the pool, of the current device.
 static CUresult
 small_alloc(CUdeviceptr *dptr, size_t size)
 {
-  size = (size + ALIGN - 1) / ALIGN * ALIGN;
   CUdevice dev;
   CUresult rc = cuCtxGetDevice(&dev);
   if (rc != CUDA_SUCCESS) {
     return rc;
   }
-  for (int c = 0; c < n_chunks; c++) {
-    Chunk *ch = &chunks[c];
-    if (!ch->on || ch->dev != dev) {
-      continue;
-    }
-    for (int b = 0; b < ch->n_blocks; b++) {
-      Block *bl = &ch->blocks[b];
-      if (bl->used || bl->size < size) {
-        continue;
-      }
-      if (bl->size > size && ch->n_blocks < MAX_BLOCKS) {   // split
-        memmove(&ch->blocks[b + 2], &ch->blocks[b + 1],
-                (ch->n_blocks - b - 1) * sizeof(Block));
-        ch->blocks[b + 1] = (Block){ bl->off + size, bl->size - size, 0 };
-        ch->n_blocks++;
-        bl->size = size;
-      }
-      bl->used = 1;
-      *dptr = ch->base + bl->off;
-      return CUDA_SUCCESS;
-    }
+  uint64_t addr;
+  rc = pool_alloc(&pool, dev, (size + ALIGN - 1) / ALIGN * ALIGN, &addr);
+  if (rc == CUDA_SUCCESS) {
+    *dptr = addr;
   }
-  // A new chunk.
-  int c;
-  for (c = 0; c < n_chunks && chunks[c].on; c++) {
-  }
-  if (c == MAX_CHUNKS) {
-    return CUDA_ERROR_OUT_OF_MEMORY;
-  }
-  Chunk *ch = &chunks[c];
-  memset(ch, 0, sizeof *ch);
-  ch->size = granularity();
-  rc = vmm_create(ch->size, &ch->base, &ch->h, &ch->dev);
-  if (rc != CUDA_SUCCESS) {
-    return rc;
-  }
-  ch->on = 1;
-  ch->blocks[0] = (Block){ 0, size, 1 };
-  ch->blocks[1] = (Block){ size, ch->size - size, 0 };
-  ch->n_blocks = 2;
-  if (c == n_chunks) {
-    n_chunks++;
-  }
-  *dptr = ch->base;
-  return CUDA_SUCCESS;
-}
-
-// 1: freed a block of a chunk; 0: not in a chunk.
-static int
-small_free(CUdeviceptr p)
-{
-  for (int c = 0; c < n_chunks; c++) {
-    Chunk *ch = &chunks[c];
-    if (!ch->on || p < ch->base || p >= ch->base + ch->size) {
-      continue;
-    }
-    for (int b = 0; b < ch->n_blocks; b++) {
-      Block *bl = &ch->blocks[b];
-      if (ch->base + bl->off != p || !bl->used) {
-        continue;
-      }
-      bl->used = 0;
-      // Merge with free neighbors.
-      if (b + 1 < ch->n_blocks && !ch->blocks[b + 1].used) {
-        bl->size += ch->blocks[b + 1].size;
-        memmove(&ch->blocks[b + 1], &ch->blocks[b + 2],
-                (ch->n_blocks - b - 2) * sizeof(Block));
-        ch->n_blocks--;
-      }
-      if (b > 0 && !ch->blocks[b - 1].used) {
-        ch->blocks[b - 1].size += bl->size;
-        memmove(&ch->blocks[b], &ch->blocks[b + 1],
-                (ch->n_blocks - b - 1) * sizeof(Block));
-        ch->n_blocks--;
-      }
-      if (ch->n_blocks == 1 && !ch->blocks[0].used) {   // empty: give back
-        vmm_destroy(ch->base, ch->size, ch->h);
-        ch->on = 0;
-      }
-      return 1;
-    }
-    return 1;  // Inside a chunk but not a block start: ignore, like CUDA.
-  }
-  return 0;
+  return rc;
 }
 
 static CUresult
 vmm_alloc(CUdeviceptr *dptr, size_t bytesize)
 {
-  if (bytesize < SMALL_LIMIT) {
+  size();
+  if (bytesize < small_limit) {
     CUresult rc = small_alloc(dptr, bytesize);
     if (rc == CUDA_SUCCESS) {
       stats.small++;
@@ -290,11 +289,14 @@ vmm_alloc(CUdeviceptr *dptr, size_t bytesize)
     return rc;
   }
   a->size = size;
+  a-asked = bytesize;
   a->on = 1;
   if (i == n_allocs) {
     n_allocs++;
   }
   stats.vmm++;
+  count(&stats.large_asked, &stats.large_asked_max, bytesize);
+  count(&stats.large_held, &stats.large_held_max, size);
   *dptr = a->base;
   return CUDA_SUCCESS;
 }
@@ -330,7 +332,6 @@ wrap_pitch(CUdeviceptr *dptr, size_t *pitch, size_t width, size_t height,
   return rc;
 }
 
-// Whether 'p' is in an allocation of ours.  With the lock.
 static int
 is_ours(CUdeviceptr p)
 {
@@ -339,20 +340,7 @@ is_ours(CUdeviceptr p)
       return 1;
     }
   }
-  for (int c = 0; c < n_chunks; c++) {
-    Chunk *ch = &chunks[c];
-    if (!ch->on || p - ch->base >= ch->size) {
-      continue;
-    }
-    for (int b = 0; b < ch->n_blocks; b++) {
-      Block *bl = &ch->blocks[b];
-      if (bl->used && p - (ch->base + bl->off) < bl->size) {
-        return 1;
-      }
-    }
-    return 0;
-  }
-  return 0;
+  return pool_used_at(&pool, p) != NULL;
 }
 
 static CUresult
@@ -371,11 +359,13 @@ wrap_free(CUdeviceptr dptr)
     if (allocs[i].on && allocs[i].base == dptr) {
       vmm_destroy(allocs[i].base, allocs[i].size, allocs[i].h);
       allocs[i].on = 0;
+      stats.large_asked -= allocs[i].asked;
+      stats.large_held -= allocs[i].size;
       pthread_mutex_unlock(&lock);
       return CUDA_SUCCESS;
     }
   }
-  int done = small_free(dptr);
+  int done = pool_free(&pool, dptr);
   pthread_mutex_unlock(&lock);
   return done ? CUDA_SUCCESS : real_free(dptr);
 }
@@ -684,11 +674,10 @@ static void
 report(void)
 {
   if (verbose) {
-    fprintf(stderr, "[mana-vmm %d] VMM allocations: %lu large, %lu small, "
-            "%lu fallbacks, %lu frees; synchronous copies: %lu deferred to "
-            "an MPI call (%lu waits), %lu waited at once\n", getpid(),
-            stats.vmm, stats.small, stats.fallback, stats.frees,
-            stats.deferred, stats.drained, stats.immediate);
+    fprintf(stderr, "[mana-vmm %d] peak bytes: small allocations %zu in "
+            "chunks of %zu, large allocations %zu in %zu\n", getpid(),
+            pool.used_max, pool.held_max, stats.large_asked_max,
+            stats.large_held_max);
   }
 }
 
