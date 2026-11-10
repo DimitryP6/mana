@@ -96,11 +96,12 @@ test-fwd: test-fwd.c fwd-runtime.h $(OUT)/libcuda.so.1
 	$(CC) $(CFLAGS) -o $@ $< -L$(OUT) -l:libcuda.so.1 -lmana_fwd \
 	  -Wl,-rpath,'$$ORIGIN/$(OUT)' -ldl -lpthread
 
-test-pool: test-pool.c pool.h rbtree.h
-    $(CC) $(CFLAGS) -o $@ $<
+test-pool: test-pool.c pool.h rb-tree.h
+	$(CC) $(CFLAGS) -o $@ $<
 
 check: test-fwd test-pool
-	REAL_LIBCUDA=$(REAL_LIBCUDA) ./test-fwd ./test-pool
+	REAL_LIBCUDA=$(REAL_LIBCUDA) ./test-fwd 
+	./test-pool
 
 install: default
 	mkdir -p $(MANA_ROOT)/lib/dmtcp/cuda-forward

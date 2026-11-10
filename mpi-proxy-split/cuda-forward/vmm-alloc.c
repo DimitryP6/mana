@@ -12,11 +12,10 @@
  * POSIX fd), cuMemAddressReserve and cuMemMap (see redirect()).
  *
  * Allocations below MANA_VMM_SMALL_LIMIT (1 MB) are carved out of VMM chunks
- * of MANA_VMM_CHUNK_SIZE (the allocation granularity, 2 MB), best fit,
- * 512-byte aligned; one empty chunk per device stays for the next ones.  An
- * IPC export then shares the whole chunk: cuMemGetAddressRange reports the
- * chunk, as UCX expects.  Larger allocations get a VMM allocation of their
- * own.
+ * of MANA_VMM_CHUNK_SIZE (the allocation granularity, 2 MB) by pool.h: best
+ * fit, 512-byte aligned, a chunk given back once all free.  An IPC export then
+ * shares the whole chunk: cuMemGetAddressRange reports the chunk, as UCX
+ * expects.  Larger allocations get a VMM allocation of their own.
  *
  * VMM memory lacks two orderings of cudaMalloc memory, which the library
  * keeps: cudaFree waits for the device's work (wrap_free()), and the
@@ -40,8 +39,6 @@
 
 #define ALIGN 512
 #define MAX_ALLOCS 65536
-#define MAX_CHUNKS 4096
-#define MAX_DEVICES 64
 
 typedef CUresult (*alloc_fn)(CUdeviceptr *, size_t);
 typedef CUresult (*pitch_fn)(CUdeviceptr *, size_t *, size_t, size_t, unsigned);
@@ -61,17 +58,6 @@ typedef struct {                  // A VMM allocation of its own.
   CUmemGenericAllocationHandle h;
   int on;
 } Alloc;
-
-typedef struct { size_t off, size; int used; } Block;
-typedef struct {                  // A VMM chunk for small allocations.
-  CUdeviceptr base;
-  size_t size;
-  CUmemGenericAllocationHandle h;
-  CUdevice dev;
-  Block blocks[MAX_BLOCKS];
-  int n_blocks;
-  int on;
-} Chunk;
 
 static Alloc allocs[MAX_ALLOCS];
 static int n_allocs;
@@ -267,7 +253,7 @@ small_alloc(CUdeviceptr *dptr, size_t size)
 static CUresult
 vmm_alloc(CUdeviceptr *dptr, size_t bytesize)
 {
-  size();
+  sizes();
   if (bytesize < small_limit) {
     CUresult rc = small_alloc(dptr, bytesize);
     if (rc == CUDA_SUCCESS) {
@@ -289,7 +275,7 @@ vmm_alloc(CUdeviceptr *dptr, size_t bytesize)
     return rc;
   }
   a->size = size;
-  a-asked = bytesize;
+  a->asked = bytesize;
   a->on = 1;
   if (i == n_allocs) {
     n_allocs++;
@@ -674,6 +660,11 @@ static void
 report(void)
 {
   if (verbose) {
+    fprintf(stderr, "[mana-vmm %d] VMM allocations: %lu large, %lu small, "
+            "%lu fallbacks, %lu frees; synchronous copies: %lu deferred to "
+            "an MPI call (%lu waits), %lu waited at once\n", getpid(),
+            stats.vmm, stats.small, stats.fallback, stats.frees,
+            stats.deferred, stats.drained, stats.immediate);
     fprintf(stderr, "[mana-vmm %d] peak bytes: small allocations %zu in "
             "chunks of %zu, large allocations %zu in %zu\n", getpid(),
             pool.used_max, pool.held_max, stats.large_asked_max,
