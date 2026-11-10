@@ -134,7 +134,7 @@ main(void)
         printf("op %d: data of buffer %d overwritten\n", op, i);
         return 1;
       }
-      if (rand() % 50 == 0 && pool_free(&p, addr[i] + 512) != 1) {
+      if (rand() % 50 == 0 && pool_free(&p, addr[i] + 1) != 1) {
         printf("op %d: an address inside a block was not ignored\n", op);
         return 1;
       }
