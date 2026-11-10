@@ -35,7 +35,7 @@ check-cudart:
 	  echo "cuda-forward: no CUDA runtime found; set REAL_LIBCUDART"; exit 1; \
 	fi
 
-libmana_cuda_vmm.so: vmm-alloc.c
+libmana_cuda_vmm.so: vmm-alloc.c pool.h rb-tree.h
 	$(CC) $(CFLAGS) -shared -o $@ $< -L$(dir $(REAL_LIBCUDA)) -l:libcuda.so.1 \
 	  -ldl -lpthread
 
@@ -96,8 +96,11 @@ test-fwd: test-fwd.c fwd-runtime.h $(OUT)/libcuda.so.1
 	$(CC) $(CFLAGS) -o $@ $< -L$(OUT) -l:libcuda.so.1 -lmana_fwd \
 	  -Wl,-rpath,'$$ORIGIN/$(OUT)' -ldl -lpthread
 
-check: test-fwd
-	REAL_LIBCUDA=$(REAL_LIBCUDA) ./test-fwd
+test-pool: test-pool.c pool.h rbtree.h
+    $(CC) $(CFLAGS) -o $@ $<
+
+check: test-fwd test-pool
+	REAL_LIBCUDA=$(REAL_LIBCUDA) ./test-fwd ./test-pool
 
 install: default
 	mkdir -p $(MANA_ROOT)/lib/dmtcp/cuda-forward
@@ -106,6 +109,6 @@ install: default
 	cp -f libmana_cuda_vmm.so $(MANA_ROOT)/lib/dmtcp/
 
 clean:
-	rm -rf $(OUT) gen libmana_cuda_vmm.so test-fwd
+	rm -rf $(OUT) gen libmana_cuda_vmm.so test-fwd test-pool
 
 .PHONY: default check-cudart check install clean
