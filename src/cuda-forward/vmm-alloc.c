@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include "pool.h"
 
@@ -72,6 +73,80 @@ static struct {
   size_t large_asked, large_held, large_asked_max, large_held_max;
 } stats;
 
+/*
+ * MANA_VMM_PROFILE=1: how often each part of the allocator runs and how long
+ * it takes, printed at exit (prof_report()).  Parts nest (a cuMemCreate is
+ * part of a cudaMalloc), so their times do not add up.  Without it, each
+ * timer costs a branch.
+ */
+enum {
+  P_ALLOC, P_ALLOC_LOCK, P_SMALL, P_LARGE, P_FALLBACK,
+  P_FREE, P_FREE_SYNC, P_FREE_LOCK, P_SMALL_FREE, P_LARGE_FREE,
+  P_CREATE, P_RESERVE, P_MAP, P_ACCESS, P_UNMAP, P_ADDR_FREE, P_RELEASE,
+  P_MEMOP, P_DEFER, P_WAIT, P_DRAIN, P_SETATTR,
+  N_PROF
+};
+static const char *const prof_names[N_PROF] = {
+  "cudaMalloc (wrap_alloc)",
+  "  waiting for the lock",
+  "  small: from the pool (pool_alloc)",
+  "  large: a VMM allocation of its own",
+  "  fallback: the real cuMemAlloc",
+  "cudaFree (wrap_free)",
+  "  waiting for the device (cuCtxSynchronize)",
+  "  waiting for the lock",
+  "  small: back to the pool (pool_free)",
+  "  large: its VMM allocation released",
+  "cuMemCreate (a new chunk or a large allocation)",
+  "cuMemAddressReserve",
+  "cuMemMap",
+  "cuMemSetAccess",
+  "cuMemUnmap (a released chunk or a large free)",
+  "cuMemAddressFree",
+  "cuMemRelease",
+  "synchronous copy or set (the driver's call)",
+  "  ordering: an event, waited for at the next MPI call",
+  "  ordering: waited for at once (cuStreamSynchronize)",
+  "MPI call: waiting for the events (mana_vmm_drain)",
+  "cuPointerSetAttribute (wrap_setattr)",
+};
+static struct {
+  unsigned long calls;
+  unsigned long long ns;
+} prof[N_PROF];
+static int profiling;
+static unsigned long long prof_start;
+
+static unsigned long long
+prof_now(void)
+{
+  if (!profiling) {
+    return 0;
+  }
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+// Counts a call of part 'which' that started at 't0' (from prof_now()).
+static void
+prof_add(int which, unsigned long long t0)
+{
+  if (profiling) {
+    __atomic_fetch_add(&prof[which].calls, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&prof[which].ns, prof_now() - t0, __ATOMIC_RELAXED);
+  }
+}
+
+// The value of 'expr', a call timed as part 'which'.
+#define TIMED(which, expr)                                                    \
+  ({                                                                          \
+    unsigned long long t_ = prof_now();                                       \
+    __typeof__(expr) r_ = (expr);                                             \
+    prof_add(which, t_);                                                      \
+    r_;                                                                       \
+  })
+
 // Whether VMM memory of 'dev' can be made GPUDirect RDMA capable.  A NIC
 // (e.g. Slingshot's, through libfabric's CXI provider) can register VMM
 // memory only if it was created so; cudaMalloc memory always can be.
@@ -109,10 +184,11 @@ vmm_create(size_t size, CUdeviceptr *base, CUmemGenericAllocationHandle *h,
   prop.location.id = dev;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
   prop.allocFlags.gpuDirectRDMACapable = rdma_capable(dev);
-  if ((rc = cuMemCreate(h, size, &prop, 0)) != CUDA_SUCCESS) {
+  if ((rc = TIMED(P_CREATE, cuMemCreate(h, size, &prop, 0))) != CUDA_SUCCESS) {
     return rc;
   }
-  if ((rc = cuMemAddressReserve(base, size, 0, 0, 0)) != CUDA_SUCCESS) {
+  if ((rc = TIMED(P_RESERVE, cuMemAddressReserve(base, size, 0, 0, 0))) !=
+      CUDA_SUCCESS) {
     cuMemRelease(*h);
     return rc;
   }
@@ -120,8 +196,9 @@ vmm_create(size_t size, CUdeviceptr *base, CUmemGenericAllocationHandle *h,
   memset(&acc, 0, sizeof acc);
   acc.location = prop.location;
   acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  if ((rc = cuMemMap(*base, size, 0, *h, 0)) != CUDA_SUCCESS ||
-      (rc = cuMemSetAccess(*base, size, &acc, 1)) != CUDA_SUCCESS) {
+  if ((rc = TIMED(P_MAP, cuMemMap(*base, size, 0, *h, 0))) != CUDA_SUCCESS ||
+      (rc = TIMED(P_ACCESS, cuMemSetAccess(*base, size, &acc, 1))) !=
+        CUDA_SUCCESS) {
     cuMemUnmap(*base, size);
     cuMemAddressFree(*base, size);
     cuMemRelease(*h);
@@ -136,9 +213,9 @@ vmm_create(size_t size, CUdeviceptr *base, CUmemGenericAllocationHandle *h,
 static void
 vmm_destroy(CUdeviceptr base, size_t size, CUmemGenericAllocationHandle h)
 {
-  cuMemUnmap(base, size);
-  cuMemAddressFree(base, size);
-  cuMemRelease(h);
+  (void)TIMED(P_UNMAP, cuMemUnmap(base, size));
+  (void)TIMED(P_ADDR_FREE, cuMemAddressFree(base, size));
+  (void)TIMED(P_RELEASE, cuMemRelease(h));
 }
 
 static size_t
@@ -255,7 +332,7 @@ vmm_alloc(CUdeviceptr *dptr, size_t bytesize)
 {
   sizes();
   if (bytesize < small_limit) {
-    CUresult rc = small_alloc(dptr, bytesize);
+    CUresult rc = TIMED(P_SMALL, small_alloc(dptr, bytesize));
     if (rc == CUDA_SUCCESS) {
       stats.small++;
     }
@@ -270,7 +347,7 @@ vmm_alloc(CUdeviceptr *dptr, size_t bytesize)
   size_t g = granularity();
   size_t size = (bytesize + g - 1) / g * g;
   Alloc *a = &allocs[i];
-  CUresult rc = vmm_create(size, &a->base, &a->h, NULL);
+  CUresult rc = TIMED(P_LARGE, vmm_create(size, &a->base, &a->h, NULL));
   if (rc != CUDA_SUCCESS) {
     return rc;
   }
@@ -293,13 +370,18 @@ wrap_alloc(CUdeviceptr *dptr, size_t bytesize)
   if (bytesize == 0 || dptr == NULL) {
     return real_alloc(dptr, bytesize);
   }
+  unsigned long long t = prof_now();
+  unsigned long long t_lock = prof_now();
   pthread_mutex_lock(&lock);
+  prof_add(P_ALLOC_LOCK, t_lock);
   CUresult rc = vmm_alloc(dptr, bytesize);
   pthread_mutex_unlock(&lock);
   if (rc != CUDA_SUCCESS) {
     stats.fallback++;
-    rc = real_alloc(dptr, bytesize);   // e.g. no VMM support: as before
+    // e.g. no VMM support: as before
+    rc = TIMED(P_FALLBACK, real_alloc(dptr, bytesize));
   }
+  prof_add(P_ALLOC, t);
   return rc;
 }
 
@@ -338,22 +420,30 @@ wrap_free(CUdeviceptr dptr)
   // cudaFree waits for the device's work (the driver's cuMemFree_v2 does),
   // so that no kernel or copy still uses memory that a new allocation may
   // get.  Wait as well.
-  ctx_sync();
+  unsigned long long t = prof_now();
+  (void)TIMED(P_FREE_SYNC, ctx_sync());
+  unsigned long long t_lock = prof_now();
   pthread_mutex_lock(&lock);
+  prof_add(P_FREE_LOCK, t_lock);
   stats.frees++;
   for (int i = 0; i < n_allocs; i++) {
     if (allocs[i].on && allocs[i].base == dptr) {
+      unsigned long long t_large = prof_now();
       vmm_destroy(allocs[i].base, allocs[i].size, allocs[i].h);
+      prof_add(P_LARGE_FREE, t_large);
       allocs[i].on = 0;
       stats.large_asked -= allocs[i].asked;
       stats.large_held -= allocs[i].size;
       pthread_mutex_unlock(&lock);
+      prof_add(P_FREE, t);
       return CUDA_SUCCESS;
     }
   }
-  int done = pool_free(&pool, dptr);
+  int done = TIMED(P_SMALL_FREE, pool_free(&pool, dptr));
   pthread_mutex_unlock(&lock);
-  return done ? CUDA_SUCCESS : real_free(dptr);
+  CUresult rc = done ? CUDA_SUCCESS : real_free(dptr);
+  prof_add(P_FREE, t);
+  return rc;
 }
 
 /*
@@ -399,6 +489,7 @@ mana_vmm_drain(void)
 {
   CUevent evs[2 * MAX_PENDING];
   int n = 0;
+  unsigned long long t = prof_now();
   pthread_mutex_lock(&pending_lock);
   for (int i = 0; i < n_pendings; i++) {
     for (int k = 0; k < 2; k++) {
@@ -414,6 +505,7 @@ mana_vmm_drain(void)
   for (int i = 0; i < n; i++) {
     cuEventSynchronize(evs[i]);  // An error shows at the next CUDA call.
   }
+  prof_add(P_DRAIN, t);
 }
 
 // Records an event after a copy on default stream k (0: legacy, 1:
@@ -470,11 +562,11 @@ static void
 order_memop(int k)
 {
   int (*mpi)(void) = __atomic_load_n(&forwarding, __ATOMIC_ACQUIRE);
-  if (mpi != NULL && !mpi() && defer_memop(k)) {
+  if (mpi != NULL && !mpi() && TIMED(P_DEFER, defer_memop(k))) {
     return;                     // the application's: until the next MPI call
   }
   __atomic_fetch_add(&stats.immediate, 1, __ATOMIC_RELAXED);
-  stream_sync(k ? CU_STREAM_PER_THREAD : CU_STREAM_LEGACY);
+  (void)TIMED(P_WAIT, stream_sync(k ? CU_STREAM_PER_THREAD : CU_STREAM_LEGACY));
 }
 
 // The synchronous copies and sets, on the legacy (k = 0) and the per-thread
@@ -483,7 +575,7 @@ order_memop(int k)
   static CUresult (*real_##name) params;                                      \
   static CUresult wrap_##name params                                          \
   {                                                                           \
-    CUresult rc = real_##name args;                                           \
+    CUresult rc = TIMED(P_MEMOP, real_##name args);                           \
     if (rc == CUDA_SUCCESS) {                                                 \
       order_memop(k);                                                         \
     }                                                                         \
@@ -525,15 +617,19 @@ SYNC_MEMOPS(cuMemsetD2D32_v2, (CUdeviceptr d, size_t pitch, unsigned int v,
 static CUresult
 wrap_setattr(const void *value, CUpointer_attribute attribute, CUdeviceptr ptr)
 {
+  unsigned long long t = prof_now();
   if (attribute == CU_POINTER_ATTRIBUTE_SYNC_MEMOPS) {
     pthread_mutex_lock(&lock);
     int ours = is_ours(ptr);
     pthread_mutex_unlock(&lock);
     if (ours) {
+      prof_add(P_SETATTR, t);
       return CUDA_SUCCESS;
     }
   }
-  return real_setattr(value, attribute, ptr);
+  CUresult rc = real_setattr(value, attribute, ptr);
+  prof_add(P_SETATTR, t);
+  return rc;
 }
 
 #define MEMOP(name) { #name, (void *)wrap_##name, (void **)&real_##name }
@@ -672,9 +768,34 @@ report(void)
   }
 }
 
+// MANA_VMM_PROFILE: each part's calls, total and mean time, and share of the
+// time since the library was loaded.  With several threads, the shares can
+// add up to more than 100%.
+static void
+prof_report(void)
+{
+  double run = (prof_now() - prof_start) / 1e9;
+  fprintf(stderr, "[mana-vmm %d] profile of %.3f s (MANA_VMM_PROFILE):\n"
+          "  %10s %12s %10s %8s  %s\n", getpid(), run, "calls", "total ms",
+          "mean us", "% run", "part");
+  for (int i = 0; i < N_PROF; i++) {
+    if (prof[i].calls == 0) {
+      continue;
+    }
+    fprintf(stderr, "  %10lu %12.3f %10.2f %8.3f  %s\n", prof[i].calls,
+            prof[i].ns / 1e6, prof[i].ns / 1e3 / prof[i].calls,
+            run > 0 ? prof[i].ns / 1e7 / run : 0.0, prof_names[i]);
+  }
+}
+
 __attribute__((constructor)) static void
 vmm_alloc_init(void)
 {
+  profiling = getenv("MANA_VMM_PROFILE") != NULL;
+  if (profiling) {
+    prof_start = prof_now();
+    atexit(prof_report);
+  }
   if (getenv("MANA_CUDA_VMM_ALLOC") == NULL) {
     return;
   }
