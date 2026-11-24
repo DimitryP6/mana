@@ -242,7 +242,7 @@ small_alloc(CUdeviceptr *dptr, size_t size)
   if (rc != CUDA_SUCCESS) {
     return rc;
   }
-  uint64_t addr;
+  uint64_t addr = 0;
   rc = pool_alloc(&pool, dev, (size + ALIGN - 1) / ALIGN * ALIGN, &addr);
   if (rc == CUDA_SUCCESS) {
     *dptr = addr;
