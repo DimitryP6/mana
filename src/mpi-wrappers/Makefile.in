@@ -1,0 +1,149 @@
+# @configure_input@
+
+# The compilers and flags found by configure.  Without CC here, make uses cc,
+# which is the Cray compiler wrapper on some Cray systems.
+CC = @CC@
+CFLAGS = @CFLAGS@
+CXXFLAGS = @CXXFLAGS@
+MPICC = @MPICC@
+MPICXX = @MPICXX@ -std=c++20
+MPIFC = @MPIFC@
+
+# By default, your resulting plugin library will have this name.
+LIBNAME=libmpiwrappers
+
+LOWER_HALF_SRCDIR=../lower-half
+PLUGIN_HALF_SRCDIR=..
+
+# As you add new files to your plugin library, add the object file names here.
+LIBWRAPPER_OBJS = mpi_p2p_wrappers.o mpi_collective_wrappers.o \
+                  mpi_request_wrappers.o mpi_type_wrappers.o \
+                  mpi_comm_wrappers.o mpi_group_wrappers.o \
+                  mpi_cart_wrappers.o mpi_op_wrappers.o \
+                  mpi_unimplemented_wrappers.o mpi_fortran_wrappers.o \
+                  mpi_fortran_attr_wrappers.o \
+                  mpi_wrappers.o get_fortran_constants.o fortran_constants.o \
+                  mpi_win_wrappers.o mpi_file_wrappers.o mpi_error_wrappers.o \
+                  mpi_t_wrappers.o
+
+
+# MANA_ROOT and DMTCP_ROOT in the environment replace these.
+ifndef MANA_ROOT
+  MANA_ROOT=@top_srcdir@
+endif
+ifndef DMTCP_ROOT
+  DMTCP_ROOT=${MANA_ROOT}/dmtcp
+endif
+DMTCP_INCLUDE=${DMTCP_ROOT}/include
+JALIB_INCLUDE=${DMTCP_ROOT}/jalib
+
+# This inherits the CFLAGS/CXXFLAGS from './configure' (w/ optional --enable-debug)..
+override CFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${PLUGIN_HALF_SRCDIR} \
+	                 -I${LOWER_HALF_SRCDIR}
+override CXXFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${JALIB_INCLUDE} \
+                     -I${PLUGIN_HALF_SRCDIR} -I${DMTCP_ROOT}/src \
+                     -I${LOWER_HALF_SRCDIR}
+# The upper half has no MPI library, so leave out the C++ bindings that
+# mpi.h declares in C++ (Open MPI 4.1: MPI::Datatype::Free(), ...), whose
+# code is in libmpi_cxx.so.
+override CXXFLAGS += -DOMPI_SKIP_MPICXX -DMPICH_SKIP_MPICXX
+
+default: ${LIBNAME}.a libmpistub.so libmpistub_audit.so
+
+${LIBNAME}.a: ${LIBWRAPPER_OBJS}
+	ar cr $@ $^
+
+mpi_unimplemented_wrappers.cpp: generate-mpi-unimplemented-wrappers.py \
+	mpi_unimplemented_wrappers.txt
+	python3 $^ > $@
+
+# -MMD -MP writes the headers that an object includes into its .d file,
+# which make reads below.  So a change to a header rebuilds the objects
+# that include it.
+.c.o:
+	${MPICC} ${CFLAGS} -MMD -MP -c -o $@ $<
+
+.cpp.o:
+	${MPICXX} ${CXXFLAGS} -MMD -MP -c -o $@ $<
+
+-include $(wildcard *.d)
+
+# FIXME:  This assumes 'CFLAGS' is compatible with FORTRAN, since MANA does not
+#         define 'FFLAGS'.  But Fortran doesn't use '-std=gnu11' from CFLAGS.
+fortran_constants.o: fortran_constants.f90
+	${MPIFC} ${CFLAGS} -fPIC -c -o $@ $<
+
+# We need to write to mpi_stub_wrappers.c.tmp.$$ first, in case of 'make -j'.
+# The parallel make would generate mpi_stub_wrappers.c 3 times, and overwrite.
+mpi_stub_wrappers.c: generate-mpi-stub-wrappers.py mpi_stub_wrappers.txt
+	rm -f $@
+	tmp=$@.tmp.$$$$ ; \
+	printf "%s\n\n" \
+	 "// *** THIS FILE IS AUTO-GENERATED! DO 'make' TO UPDATE. ***" >$$tmp;\
+	python3 $^ >> $$tmp && mv -f $$tmp $@ || (rm -f $$tmp && false)
+
+mpi_fortran_wrappers.cpp: generate-mpi-fortran-wrappers.py \
+                          mpi_fortran_wrappers.txt
+	rm -f $@
+	tmp=$@.tmp.$$$$ ; \
+	printf "%s\n\n" \
+	 "// *** THIS FILE IS AUTO-GENERATED! DO 'make' TO UPDATE. ***" >$$tmp;\
+	python3 $^ >> $$tmp && mv -f $$tmp $@ || (rm -f $$tmp && false)
+
+# With Open MPI, a predefined handle is the address of an object in the MPI
+# library, which libmpistub.so must define too.
+mpi_stub_objects.c: generate-mpi-stub-objects.py
+	rm -f $@
+	tmp=$@.tmp.$$$$ ; \
+	printf "%s\n\n" \
+	 "// *** THIS FILE IS AUTO-GENERATED! DO 'make' TO UPDATE. ***" >$$tmp;\
+	python3 $< ${MPICC} >> $$tmp && mv -f $$tmp $@ || (rm -f $$tmp && false)
+
+libmpistub.so: mpi_stub_wrappers.o mpi_stub_data.o mpi_stub_objects.o
+	${CC} -fPIC $^ -shared -o $@
+
+# An LD_AUDIT module for the upper half.  It must not depend on any shared
+# library, not even libc.  Otherwise ld.so loads a second libc into the
+# module's namespace.  The Cray compiler wrapper adds -lxpmem even with
+# -nostdlib.  So the rule checks the module with readelf before installing
+# it.  The rule also depends on this Makefile, so that an existing build
+# rechecks the module when the Makefile is regenerated.
+libmpistub_audit.so: mpi_stub_audit.c Makefile
+	tmp=$@.tmp.$$$$ ; \
+	${CC} -O2 -fPIC -shared -nostdlib -fno-stack-protector \
+	  -Wl,--no-undefined -o $$tmp $< || { rm -f $$tmp; exit 1; } ; \
+	dynamic=$$(readelf -d $$tmp) || { \
+	  echo "readelf could not read $@"; rm -f $$tmp; exit 1; } ; \
+	if echo "$$dynamic" | grep NEEDED; then \
+	  echo "$@ must not depend on any shared library."; \
+	  echo "Build it with a plain C compiler, such as gcc."; \
+	  rm -f $$tmp; exit 1; \
+	fi ; \
+	mv -f $$tmp $@
+
+tidy:
+	rm -f *~ .*.swp dmtcp_restart_script*.sh ckpt_*.dmtcp
+	rm -rf ckpt_rank_*
+	rm -f dmtcp_coordinator_db-*.json
+
+stage: libmpistub.so libmpistub_audit.so
+	cp -f libmpistub.so libmpistub_audit.so ${MANA_ROOT}/lib/dmtcp/
+
+clean: tidy
+	rm -f ${LIBWRAPPER_OBJS} *.d
+	rm -f ${LIBNAME}.a libmpistub.so mpi_stub_data.o libmpistub_audit.so
+	rm -f mpi_stub_objects.c mpi_stub_objects.o
+	rm -f ${MANA_ROOT}/lib/dmtcp/libmpistub.so
+	rm -f ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so
+	rm -f mpi_stub_wrappers.c
+	rm -f mpi_unimplemented_wrappers.cpp
+	rm -f mpi_fortran_wrappers.cpp
+
+
+distclean: clean
+
+.PHONY: default clean distclean tidy stage
+
+# Regenerate this Makefile when Makefile.in or config.status is newer.
+Makefile: Makefile.in @top_builddir@/config.status
+	cd @top_builddir@ && ./config.status src/mpi-wrappers/Makefile

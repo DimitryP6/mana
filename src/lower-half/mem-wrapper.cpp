@@ -1,0 +1,846 @@
+/****************************************************************************
+ *  Copyright (C) 2019-2020 by Twinkle Jain, Rohan garg, and Gene Cooperman *
+ *  jain.t@husky.neu.edu, rohgarg@ccs.neu.edu, gene@ccs.neu.edu             *
+ *                                                                          *
+ *  This file is part of DMTCP.                                             *
+ *                                                                          *
+ *  DMTCP is free software: you can redistribute it and/or                  *
+ *  modify it under the terms of the GNU Lesser General Public License as   *
+ *  published by the Free Software Foundation, either version 3 of the      *
+ *  License, or (at your option) any later version.                         *
+ *                                                                          *
+ *  DMTCP is distributed in the hope that it will be useful,                *
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           *
+ *  GNU Lesser General Public License for more details.                     *
+ *                                                                          *
+ *  You should have received a copy of the GNU Lesser General Public        *
+ *  License along with DMTCP:dmtcp/src.  If not, see                        *
+ *  <http://www.gnu.org/licenses/>.                                         *
+ ****************************************************************************/
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // For MAP_ANONYMOUS
+#endif
+#include <elf.h>
+#include <errno.h>
+#include <stddef.h>
+#include <assert.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <vector>
+#include <algorithm>
+
+#include "lower-half-api.h"
+#include "patch-trampoline.h"
+#include "logging.h"
+#include "mem-wrapper.h"
+#include "switch-context.h"
+
+using namespace std;
+
+#define _real_mmap mmap
+#define _real_munmap munmap
+#define _real_mremap mremap
+
+std::vector<MmapInfo_t> allocated_blocks;
+std::vector<MmapInfo_t> free_blocks;
+char *max_allocated_addr = NULL;
+
+// No signal while FS is the lower half's: DMTCP's handler uses TLS (#542).
+static uint64_t
+block_signals()
+{
+  uint64_t all = ~0ULL, old;
+  syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &old, sizeof(all));
+  return old;
+}
+
+static void
+restore_signals(uint64_t old)
+{
+  syscall(SYS_rt_sigprocmask, SIG_SETMASK, &old, NULL, sizeof(old));
+}
+
+// Reentrant per kernel thread: all threads share one TLS here (#542).
+static volatile pid_t wrapper_owner = 0;
+static int wrapper_depth = 0;
+
+static void
+lock_wrappers()
+{
+  pid_t self = (pid_t)syscall(SYS_gettid);
+  if (__atomic_load_n(&wrapper_owner, __ATOMIC_ACQUIRE) == self) {
+    wrapper_depth++;
+    return;
+  }
+  pid_t none = 0;
+  while (!__atomic_compare_exchange_n(&wrapper_owner, &none, self, false,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    none = 0;
+    sched_yield();
+  }
+  wrapper_depth = 1;
+}
+
+static void
+unlock_wrappers()
+{
+  if (--wrapper_depth == 0) {
+    __atomic_store_n(&wrapper_owner, 0, __ATOMIC_RELEASE);
+  }
+}
+static char *arena_base = NULL;
+
+static void* __mmap_wrapper(void * , size_t , int , int , int , off_t);
+static void patchLibc(int , char * , char *);
+static void uhExit(int status);
+static int __munmap_wrapper(void *, size_t);
+static void* __mremap_wrapper(char *, size_t, size_t, int, char *);
+static void patchSbrk(char *, char *, size_t);
+
+off_t get_symbol_offset(const char *pathame, const char *symbol);
+
+bool mem_compare (MmapInfo_t &a, MmapInfo_t &b) {
+  return (a.addr < b.addr);
+}
+
+void merge_overlap_blocks(MmapInfo_t new_block, vector<MmapInfo_t> &blocks) {
+  MmapInfo_t merged_block = new_block;
+  // Find and merge all overlapping blocks in the allocated list.
+  size_t blocks_size = blocks.size();
+  for (size_t i = 0; i < blocks_size;) {
+    char *it_end_addr = blocks[i].addr + blocks[i].len;
+    char *merged_end_addr = merged_block.addr + merged_block.len;
+    if (it_end_addr < merged_block.addr) {
+      i++;
+      continue;
+    } else if (blocks[i].addr > merged_end_addr) {
+      // If the iterator points to a block whose start address
+      // is larger than the end address of the merged block, there's
+      // no more blocks that may overlap with the merged_block since
+      // the allocated list is sorted.
+      break;
+    } else {
+      char *min_start_addr, *max_end_addr;
+      if (blocks[i].addr < merged_block.addr) {
+        min_start_addr = blocks[i].addr;
+      } else {
+        min_start_addr = merged_block.addr;
+      }
+      if (it_end_addr > merged_end_addr) {
+        max_end_addr = blocks[i].addr + blocks[i].len;
+      } else {
+        max_end_addr = merged_end_addr;
+      }
+      merged_block.addr = min_start_addr;
+      merged_block.len = max_end_addr - min_start_addr;
+      blocks.erase(blocks.begin() + i);
+      blocks_size--;
+    }
+  }
+  // Insert the new allocated block and sort the list.
+  blocks.push_back(merged_block);
+  std::sort(blocks.begin(), blocks.end(), mem_compare);
+}
+
+void remove_overlap_blocks(MmapInfo_t new_block, vector<MmapInfo_t> &blocks) {
+  char *new_block_end_addr = new_block.addr + new_block.len;
+  char *old_it_start = NULL, *old_it_end = NULL;
+  size_t blocks_size = blocks.size();
+  for (size_t i = 0; i < blocks_size;) {
+    char *it_end_addr = blocks[i].addr + blocks[i].len;
+    if (blocks[i].addr == NULL || (blocks[i].addr == old_it_start && it_end_addr == old_it_end)) {
+      printf("loop detected\n");
+      fflush(stdout);
+      volatile int dummy = 1;
+      while (dummy);
+    } else {
+      old_it_start = blocks[i].addr;
+      old_it_end = it_end_addr;
+    }
+    if (it_end_addr <= new_block.addr) {
+      i++;
+      continue;
+    } else if (blocks[i].addr >= new_block_end_addr) {
+      // If the iterator points to a block whose start address
+      // is larger than the end address of the new block, there's
+      // no more blocks that may overlap with the merged_block since
+      // the allocated list is sorted.
+      break;
+    } else {
+      MmapInfo_t updated_block;
+      if (blocks[i].addr < new_block.addr) {
+        if (it_end_addr > new_block.addr && it_end_addr < new_block_end_addr) {
+          // Overlap case 1:
+          // [==it==]
+          //      [==new_block==]
+          updated_block.addr = blocks[i].addr;
+          updated_block.len = blocks[i].len - (it_end_addr - new_block.addr);
+          blocks.erase(blocks.begin() + i);
+          blocks_size--;
+          if (updated_block.len > 0) {
+            blocks.push_back(updated_block);
+          }
+        } else {
+          // Overlap case 2:
+          // [==========it==========]
+          //      [==new_block==]
+          // New free block in front
+          updated_block.addr = blocks[i].addr;
+          updated_block.len = blocks[i].len - (it_end_addr - new_block.addr);
+          blocks.erase(blocks.begin() + i);
+          blocks_size--;
+          if (updated_block.len > 0) {
+            blocks.push_back(updated_block);
+          }
+          // New free block at back
+          updated_block.addr = new_block_end_addr;
+          updated_block.len = it_end_addr - new_block_end_addr;
+          if (updated_block.len > 0) {
+            blocks.push_back(updated_block);
+          }
+        }
+      } else { 
+        if (it_end_addr > new_block_end_addr) {
+          // Overlap case 3:
+          //           [==it==]
+          // [==new_block==]
+          updated_block.addr = new_block_end_addr;
+          updated_block.len = it_end_addr - new_block_end_addr;
+          blocks.erase(blocks.begin() + i);
+          blocks_size--;
+          if (updated_block.len > 0) {
+            blocks.push_back(updated_block);
+          }
+        } else {
+          // Overlap case 4:
+          //    [==it==]
+          // [==new_block==]
+          blocks.erase(blocks.begin() + i);
+          blocks_size--;
+        }
+      }
+    }
+  }
+  std::sort(blocks.begin(), blocks.end(), mem_compare);
+}
+
+// Calls fn(start, end) per mapping in /proc/self/maps until it returns true.
+template <typename Fn>
+static void for_each_mapping(Fn fn) {
+  int fd = open("/proc/self/maps", O_RDONLY);
+  if (fd < 0) {
+    return;
+  }
+  static char buf[1 << 16];
+  size_t used = 0;
+  bool done = false;
+  while (!done) {
+    ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
+    if (n <= 0) {
+      break;
+    }
+    used += n;
+    buf[used] = '\0';
+    char *line = buf;
+    char *nl;
+    while (!done && (nl = strchr(line, '\n')) != NULL) {
+      unsigned long start, end;
+      if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+        done = fn((char*)start, (char*)end);
+      }
+      line = nl + 1;
+    }
+    used = buf + used - line;  // A partial line stays for the next read
+    memmove(buf, line, used);
+  }
+  close(fd);
+}
+
+void *next_free_addr(char *addr, size_t length) {
+  uintptr_t align_mask = PAGE_SIZE - 1;
+  if (addr != NULL) {
+    uintptr_t hint_align = (uintptr_t)addr & -(uintptr_t)addr;
+    if (hint_align > (uintptr_t)PAGE_SIZE && hint_align <= (1UL << 21)) {
+      align_mask |= (hint_align - 1);
+    }
+  }
+  for (auto it = free_blocks.begin(); it != free_blocks.end(); it++) {
+    char *aligned = (char*) ROUND_UP((unsigned long)it->addr, align_mask + 1);
+    if ((size_t)(aligned - it->addr) + length <= it->len) {
+      return aligned;
+    }
+  }
+  return NULL;
+}
+
+void init_mem_arena(char *base)
+{
+  arena_base = base;
+  free_blocks.clear();
+  // This [arena_base, SIZE_MAX] pair is just for bookkeeping, suggesting
+  // this area is available for the mmap wrapper to allocate memories.
+  // The wrapper allocates memories starting from the arena_base address.
+  // We are not really mapping this region in the memory now at this moment.
+  // It ends at the first mapping above it, so a request too large fails (#533).
+  size_t len = SIZE_MAX / 2;
+  for_each_mapping([&](char *start, char *end) {
+    if (start >= base) {
+      len = start - base;
+    }
+    return start >= base;
+  });
+  free_blocks.push_back({arena_base, len});
+  // CUDA: keep the CUDA driver's preferred UVA range out of the
+  // arena, so that the upper half's CUDA reserves it as in a native process.
+  // cuCheckpointProcessRestore() fails (CUDA_ERROR_OUT_OF_MEMORY) for a
+  // process whose driver had to place its UVA range elsewhere.
+  remove_overlap_blocks({(char*)0x200000000UL, 0x100200000UL}, free_blocks);
+}
+
+// At restart, after restore_mmap() has mapped the upper half's areas, the
+// upper half's new areas go above them.  Without an arena, they would go
+// where the kernel puts them, among the lower half's mappings, and a later
+// restart's lower half may already have mapped that address.
+void init_mem_arena_after_restore()
+{
+  init_mem_arena((char*)ROUND_UP(max_allocated_addr, PAGE_SIZE));
+}
+
+// Returns a pointer to the array of mmap-ed regions
+// Sets num to the number of valid items in the array
+std::vector<MmapInfo_t> &get_mmapped_list(int *num) {
+  *num = allocated_blocks.size();
+  return allocated_blocks;
+}
+
+int checkLibrary(int fd, const char* name,
+             char* glibcFullPath, size_t size) {
+  char procPath[PATH_MAX] = {0};
+  char fullPath[PATH_MAX] = {0};
+  snprintf(procPath, sizeof procPath, "/proc/self/fd/%d", fd);
+  ssize_t len = readlink(procPath, fullPath, sizeof fullPath);
+  if (len < 0) {
+    DLOG(ERROR, "Failed to get path for %s. Error: %s\n",
+         procPath, strerror(errno));
+    return 0;
+  }
+  DLOG(NOISE, "checkLibrary: %s\n", fullPath);
+  if (strstr(fullPath, name)) {
+    DLOG(NOISE, "checkLibrary found: %s\n", fullPath);
+    strncpy(glibcFullPath, fullPath, size);
+    return 1;
+  }
+  return 0;
+}
+
+
+// The upper half's heap.  The kernel's brk belongs to the lower half
+// (create_heap_guard_page()), and glibc's mmap'ed fallback arena never gives
+// memory back to the kernel, which is slow.  So the upper half's libc sbrk()
+// jumps to uhSbrk(), which moves a break of its own in a reserved region.
+// Other callers of sbrk() (DMTCP, MANA, the application) still see the
+// kernel's break: DMTCP places and restores memory around it.
+#define UH_BRK_RESERVE (1UL << 36)  // 64 GB of address space
+
+// In the reserved region's first page, so that it is checkpointed and
+// restored with the upper half.
+typedef struct {
+  char *brk;
+  char *base;            // [base, end): the heap's pages
+  char *end;
+  char *libc_text;       // [libc_text, libc_text_end): the upper half's
+  char *libc_text_end;   //   libc's code, where malloc calls sbrk()
+} UhBrk;
+
+// The upper half's sbrk(); patchSbrk() passes the heap's state in 'h'.
+static void*
+uhSbrk(intptr_t increment, UhBrk *h)
+{
+  char *caller = (char*)__builtin_return_address(0);
+  void *ret = (void*)-1;
+  uint64_t mask = block_signals();
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  if (caller < h->libc_text || caller >= h->libc_text_end) {
+    // Not malloc: the kernel's break, which the upper half cannot move.
+    if (increment == 0) {
+      ret = (void*)syscall(SYS_brk, 0);
+    }
+  } else {
+    char *old = h->brk;
+    char *brk = old + increment;
+    if (brk >= h->base && brk <= h->end) {
+      char *from = (char*)ROUND_UP(old, PAGE_SIZE);
+      char *to = (char*)ROUND_UP(brk, PAGE_SIZE);
+      int rc = 0;
+      if (to > from) {
+        rc = mprotect(from, to - from, PROT_READ | PROT_WRITE);
+      } else if (to < from) {
+        // Released pages read as zeros when the heap grows again.
+        rc = madvise(to, from - to, MADV_DONTNEED);
+        if (rc == 0) {
+          rc = mprotect(to, from - to, PROT_NONE);
+        }
+      }
+      if (rc == 0) {
+        h->brk = brk;
+        ret = old;
+      }
+    }
+  }
+  RETURN_TO_UPPER_HALF();
+  restore_signals(mask);
+  return ret;
+}
+
+// Reserves the upper half's heap and makes its libc's sbrk() jump to
+// uhSbrk().  [libc_text, libc_text + len) is that libc's code.
+static void
+patchSbrk(char *sbrk, char *libc_text, size_t len)
+{
+#if defined(__x86_64__)
+  char *r = (char*)__mmap_wrapper(NULL, UH_BRK_RESERVE, PROT_NONE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                  -1, 0);
+  if (r == MAP_FAILED || mprotect(r, PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
+    DLOG(ERROR, "No heap for the upper half: %s\n", strerror(errno));
+    return;
+  }
+  UhBrk *h = (UhBrk*)r;
+  h->base = h->brk = r + PAGE_SIZE;
+  h->end = r + UH_BRK_RESERVE;
+  h->libc_text = libc_text;
+  h->libc_text_end = libc_text + len;
+
+  unsigned char stub[] = {
+    0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0,  // movabs $h, %rsi
+    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,  // movabs $uhSbrk, %rax
+    0xff, 0xe0                           // jmp *%rax
+  };
+  void *target = (void*)&uhSbrk;
+  memcpy(stub + 2, &h, sizeof(h));
+  memcpy(stub + 12, &target, sizeof(target));
+  char *page = (char*)((unsigned long)sbrk & ~(PAGE_SIZE - 1));
+  size_t page_len =
+    ROUND_UP(sbrk + sizeof(stub), PAGE_SIZE) - (unsigned long)page;
+  if (mprotect(page, page_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    DLOG(ERROR, "Cannot patch sbrk: %s\n", strerror(errno));
+    return;
+  }
+  memcpy(sbrk, stub, sizeof(stub));
+  mprotect(page, page_len, PROT_READ | PROT_EXEC);
+#endif
+}
+
+// This is a mmap wrapper only for restoring memory after restart.
+void* restore_mmap(void *addr, size_t length, int prot,
+                   int flags, int fd, off_t offset) {
+  void *ret = MAP_FAILED;
+  length = ROUND_UP(length, PAGE_SIZE);
+  if ((char*)addr + length > max_allocated_addr) {
+    max_allocated_addr = (char*)addr + length;
+  }
+  ret = _real_mmap(addr, length, prot, flags | MAP_FIXED, fd, offset);
+  if (ret != MAP_FAILED) {
+    char *new_block_end_addr = (char*)addr + length;
+    MmapInfo_t new_block = {(char*)addr,
+                            (size_t)(new_block_end_addr - (char*)addr)};
+    merge_overlap_blocks(new_block, allocated_blocks);
+    remove_overlap_blocks(new_block, free_blocks);
+  }
+  return ret;
+}
+
+// Maps at the arena's next fit, never over an existing mapping (#533).  A
+// mapping the wrapper did not make (the lower half's, or one mremap() grew,
+// #539) leaves the free list, and the next fit is tried.
+static void* arena_mmap(char *hint, size_t length, int prot,
+                        int flags, int fd, off_t offset) {
+  for (int tries = 0; tries < 16; tries++) {
+    char *addr = (char*)next_free_addr(hint, length);
+    if (addr == NULL) {
+      break;
+    }
+    void *ret = mmap_fixed_noreplace(addr, length, prot, flags, fd, offset);
+    if (ret != MAP_FAILED) {
+      if (addr + length > max_allocated_addr) {
+        max_allocated_addr = addr + length;
+      }
+      return ret;
+    }
+    if (errno != EEXIST) {
+      return MAP_FAILED;
+    }
+    for_each_mapping([&](char *start, char *end) {
+      if (start < addr + length && end > addr) {
+        remove_overlap_blocks({start, (size_t)(end - start)}, free_blocks);
+      }
+      return start >= addr + length;
+    });
+  }
+  errno = ENOMEM;
+  return MAP_FAILED;
+}
+
+void* mmap_wrapper(void *addr, size_t length, int prot,
+                  int flags, int fd, off_t offset) {
+  void *ret = MAP_FAILED;
+  uint64_t mask = block_signals();
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  lock_wrappers();
+  ret = __mmap_wrapper(addr, length, prot, flags, fd, offset);
+  unlock_wrappers();
+  RETURN_TO_UPPER_HALF();
+  restore_signals(mask);
+  return ret;
+}
+
+int lh_world_rank = -1;
+
+// Returns the load base of the library open on 'fd', whose executable
+// segment ld.so has mapped from file offset 'offset' to 'addr'.  ld.so maps a
+// segment's page-aligned file offset to the base plus the segment's
+// page-aligned virtual address.  Returns NULL if no executable segment is
+// mapped from 'offset'.
+static char* library_base(int fd, off_t offset, char *addr)
+{
+  const Elf64_Off page_mask = ~((Elf64_Off)PAGE_SIZE - 1);
+  Elf64_Ehdr ehdr;
+  if (pread(fd, &ehdr, sizeof(ehdr), 0) != (ssize_t)sizeof(ehdr) ||
+      memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+      ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+      ehdr.e_phentsize != sizeof(Elf64_Phdr)) {
+    return NULL;
+  }
+  for (int i = 0; i < ehdr.e_phnum; i++) {
+    Elf64_Phdr phdr;
+    if (pread(fd, &phdr, sizeof(phdr), ehdr.e_phoff + i * sizeof(phdr)) !=
+        (ssize_t)sizeof(phdr)) {
+      return NULL;
+    }
+    if (phdr.p_type == PT_LOAD && (phdr.p_flags & PF_X) != 0 &&
+        (phdr.p_offset & page_mask) == (Elf64_Off)offset) {
+      return addr - (phdr.p_vaddr & page_mask);
+    }
+  }
+  return NULL;
+}
+
+static void* __mmap_wrapper(void *addr, size_t length, int prot,
+                            int flags, int fd, off_t offset) {
+  void *ret = MAP_FAILED;
+  length = ROUND_UP(length, PAGE_SIZE);
+  bool chosen = false;  // The address is the arena's, not the caller's.
+#ifdef MAP_FIXED_NOREPLACE
+  if (addr != NULL && (flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED)) {
+    // "Exactly here, or fail with EEXIST": the caller checks the address.
+    // The CUDA driver reserves its UVA ranges this way, and on restore
+    // (cuCheckpointProcessRestore) it must get the original addresses back,
+    // so the arena must not move the request.
+    ret = _real_mmap(addr, length, prot, flags, fd, offset);
+    if (ret != MAP_FAILED && (char*)ret + length > max_allocated_addr) {
+      max_allocated_addr = (char*)ret + length;
+    }
+  } else
+#endif
+  if (arena_base != NULL && addr != NULL && !(flags & MAP_FIXED) &&
+      (uintptr_t)addr < 0x7f0000000000UL &&
+      (ret = mmap_fixed_noreplace(addr, length, prot, flags, fd, offset))
+        != MAP_FAILED) {
+    // Honor a hint whose range is free.  The CUDA driver
+    // asks for its UVA range at 0x200000000 with a plain hint.  (Below the
+    // lower half's libraries, so a later restart's lower half can't be there.)
+    if ((char*)ret + length > max_allocated_addr) {
+      max_allocated_addr = (char*)ret + length;
+    }
+  } else {
+    if (arena_base != NULL) {
+      if (addr == NULL ||
+          (flags & MAP_FIXED) == 0 ||
+          (max_allocated_addr != NULL && (char*)addr > max_allocated_addr)) {
+        chosen = true;
+      }
+#ifdef MAP_FIXED_NOREPLACE
+      flags &= ~MAP_FIXED_NOREPLACE;
+#endif
+      flags |= MAP_FIXED;
+    }
+    if (chosen) {
+      ret = arena_mmap((char*)addr, length, prot, flags, fd, offset);
+    } else {
+      ret = _real_mmap(addr, length, prot, flags, fd, offset);
+    }
+  }
+  if (ret != MAP_FAILED) {
+    DLOG(NOISE, "LH: mmap (%lu): addr %p (%p) @ 0x%zx\n",
+         allocated_blocks.size(), ret, addr, length);
+    char *new_block_end_addr = (char*)ret + length;
+    MmapInfo_t new_block = {(char*)ret,
+                            (size_t)(new_block_end_addr - (char*)ret)};
+    merge_overlap_blocks(new_block, allocated_blocks);
+    remove_overlap_blocks(new_block, free_blocks);
+    // Patch each libc when ld.so maps its code, with a base computed from
+    // that mapping alone.  A base kept from an earlier mapping can be wrong,
+    // because an LD_AUDIT module's namespace can hold a second libc, and
+    // other mappings of a libc file can come before its code.
+    if (fd > 0 && (prot & PROT_EXEC)) {
+      char glibcFullPath[PATH_MAX] = {0};
+      int found = checkLibrary(fd, "libc.so", glibcFullPath, PATH_MAX) ||
+                  checkLibrary(fd, "libc-", glibcFullPath, PATH_MAX);
+      if (found) {
+        char *libc_base = library_base(fd, offset, (char*)ret);
+        if (libc_base == NULL) {
+          // Patching without a base would write to wrong addresses.  Leave
+          // this libc unpatched, and warn with fprintf(), because DLOG() is
+          // silent by default.
+          fprintf(stderr,
+                  "MANA: warning: no executable segment of %s is mapped from "
+                  "file offset 0x%lx.  Its mmap is not patched, and a restart "
+                  "may fail.\n", glibcFullPath, (long)offset);
+          return ret;
+        }
+        int rc = mprotect(ret, length, prot | PROT_WRITE);
+        if (rc < 0) {
+          DLOG(ERROR,
+               "Failed to add PROT_WRITE perms for memory region at: %p "
+               "of: %zu bytes. Error: %s\n", addr, length, strerror(errno));
+          return NULL;
+        }
+        patchLibc(fd, libc_base, glibcFullPath);
+        off_t sbrk_offset = get_symbol_offset(glibcFullPath, "__sbrk");
+        if (sbrk_offset) {
+          patchSbrk(libc_base + sbrk_offset, (char*)ret, length);
+        }
+        rc = mprotect(ret, length, prot);
+        if (rc < 0) {
+          DLOG(ERROR, "Failed to restore perms for memory region at: %p "
+              "of: %zu bytes. Error: %s\n", addr, length, strerror(errno));
+          return NULL;
+        }
+        // A second libc is unlikely, because MANA's own LD_AUDIT module does
+        // not depend on libc.  Another LD_AUDIT module or dlmopen() can still
+        // load one.  DMTCP's wrappers exist only in the program's namespace,
+        // and DMTCP cannot track threads, files or signal handlers created in
+        // the other one.  Only rank 0 warns, because all ranks normally load
+        // the same libraries.
+        static int libcs_patched = 0;
+        if (++libcs_patched == 2 && lh_world_rank <= 0) {
+          fprintf(stderr,
+                  "MANA: warning: the upper half loaded a second libc (%s), "
+                  "probably for an LD_AUDIT module or through dlmopen().  "
+                  "DMTCP cannot track threads, files or signal handlers "
+                  "created by code that uses it.  A restart may not restore "
+                  "them.\n", glibcFullPath);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int munmap_wrapper(void *addr, size_t length) {
+  int ret = -1;
+  uint64_t mask = block_signals();
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  lock_wrappers();
+  ret = __munmap_wrapper(addr, length);
+  unlock_wrappers();
+  RETURN_TO_UPPER_HALF();
+  restore_signals(mask);
+  return ret;
+}
+
+static int __munmap_wrapper(void *addr, size_t length) {
+  int ret = -1;
+  if (addr == 0) {
+    errno = EINVAL;
+    return ret;
+  }
+  length = ROUND_UP(length, PAGE_SIZE);
+  ret = _real_munmap(addr, length);
+  if (ret != -1) {
+    DLOG(NOISE, "LH: munmap (%lu): %p @ 0x%zx\n",
+         allocated_blocks.size(), addr, length);
+    char *new_block_end_addr = (char*)addr + length;
+    MmapInfo_t new_block = {(char*)addr,
+                            (size_t)(new_block_end_addr - (char*)addr)};
+    remove_overlap_blocks(new_block, allocated_blocks);
+    merge_overlap_blocks(new_block, free_blocks);
+  }
+  return ret;
+}
+
+// The upper half libc's mremap() jumps here (patchLibc()).  glibc's
+// realloc() of a block that malloc() mapped calls it.  The kernel would
+// grow the block into the arena's free range, or move it outside the arena,
+// and the free and allocated lists would miss the change (#539).
+void* mremap_wrapper(void *old_address, size_t old_size, size_t new_size,
+                     int flags, void *new_address) {
+  void *ret = MAP_FAILED;
+  uint64_t mask = block_signals();
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  lock_wrappers();
+  ret = __mremap_wrapper((char*)old_address, old_size, new_size, flags,
+                         (char*)new_address);
+  unlock_wrappers();
+  RETURN_TO_UPPER_HALF();
+  restore_signals(mask);
+  return ret;
+}
+
+// Whether [addr, addr + len) is in one of the arena's free blocks.
+static bool
+is_free_range(char *addr, size_t len)
+{
+  for (const MmapInfo_t &b : free_blocks) {
+    if (b.addr <= addr && addr + len <= b.addr + b.len) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Grows or shrinks a mapping in place when the arena's free list allows it.
+// Otherwise, with MREMAP_MAYMOVE, it moves the mapping to a range that the
+// arena reserves first, so that MREMAP_FIXED replaces only the reservation.
+static void* __mremap_wrapper(char *old_address, size_t old_size,
+                              size_t new_size, int flags, char *new_address) {
+  old_size = ROUND_UP(old_size, PAGE_SIZE);
+  new_size = ROUND_UP(new_size, PAGE_SIZE);
+  int dontunmap = 0;  // MREMAP_DONTUNMAP leaves the old mapping
+#ifdef MREMAP_DONTUNMAP
+  dontunmap = flags & MREMAP_DONTUNMAP;
+#endif
+  // The kernel rejects the flags that the wrapper does not know, and
+  // MREMAP_DONTUNMAP without MREMAP_MAYMOVE.
+  int other_flags = flags & ~(MREMAP_MAYMOVE | MREMAP_FIXED | dontunmap);
+  bool invalid = other_flags != 0 || (dontunmap && !(flags & MREMAP_MAYMOVE));
+  void *ret = MAP_FAILED;
+  if (arena_base == NULL || old_size == 0 || (flags & MREMAP_FIXED) ||
+      invalid) {
+    ret = _real_mremap(old_address, old_size, new_size, flags, new_address);
+  } else {
+    if (!dontunmap &&
+        (new_size <= old_size ||
+         is_free_range(old_address + old_size, new_size - old_size))) {
+      // Never replaces a mapping: the kernel fails if one is in the way.
+      ret = _real_mremap(old_address, old_size, new_size, 0);
+    } else if (!(flags & MREMAP_MAYMOVE)) {
+      errno = ENOMEM;
+    }
+    if (ret == MAP_FAILED && (flags & MREMAP_MAYMOVE)) {
+      void *to = arena_mmap(NULL, new_size, PROT_NONE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                            MAP_FIXED, -1, 0);
+      if (to != MAP_FAILED) {
+        ret = _real_mremap(old_address, old_size, new_size,
+                           MREMAP_MAYMOVE | MREMAP_FIXED | dontunmap, to);
+        if (ret == MAP_FAILED) {
+          _real_munmap(to, new_size);
+        }
+      }
+    }
+  }
+  if (ret != MAP_FAILED) {
+    DLOG(NOISE, "LH: mremap: %p @ 0x%zx -> %p @ 0x%zx\n", old_address,
+         old_size, ret, new_size);
+    if (!dontunmap) {
+      remove_overlap_blocks({old_address, old_size}, allocated_blocks);
+      merge_overlap_blocks({old_address, old_size}, free_blocks);
+    }
+    merge_overlap_blocks({(char*)ret, new_size}, allocated_blocks);
+    remove_overlap_blocks({(char*)ret, new_size}, free_blocks);
+    if ((char*)ret + new_size > max_allocated_addr) {
+      max_allocated_addr = (char*)ret + new_size;
+    }
+  }
+  return ret;
+}
+
+// The MPI process, not a child that the upper half forked.  Set by the
+// lower half's main() at launch and again at restart.
+static pid_t lh_pid;
+
+void
+record_lower_half_pid()
+{
+  lh_pid = syscall(SYS_getpid);
+}
+
+// The upper half libc's _exit() jumps here (patchLibc()).  If the upper half
+// is in exit() (upper_half_exiting), end through the lower half's exit() so
+// that its exit handlers run too: MPICH sends PMI finalize from one, and
+// without it the process manager kills the other ranks.  A direct _exit()
+// and a child that the upper half forked just exit.
+static void
+uhExit(int status)
+{
+  if (lh_info->fsaddr != NULL) {
+    setFS((unsigned long)lh_info->fsaddr);
+  }
+  if (lh_info->upper_half_exiting && syscall(SYS_getpid) == lh_pid) {
+    exit(status);  // The lower half's
+  }
+  syscall(SYS_exit_group, status);
+  __builtin_unreachable();
+}
+
+// Returns the offset of 'name' in the libc at 'glibc', or else in that
+// libc's debug file under /usr/lib/debug, or 0.
+static off_t libc_symbol_offset(char *glibc, const char *name)
+{
+  off_t offset = get_symbol_offset(glibc, name);
+  if (! offset) {
+    char buf[256] = "/usr/lib/debug";
+    buf[sizeof(buf)-1] = '\0';
+    ssize_t rc = 0;
+    rc = readlink(glibc, buf+strlen(buf), sizeof(buf)-strlen(buf)-1);
+    if (rc != -1 && access(buf, F_OK) == 0) {
+      // Debian family (Ubuntu, etc.) use this scheme to store debug symbols.
+      //   http://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html
+      fprintf(stderr, "Debug symbols for interpreter in: %s\n", buf);
+    }
+    offset = get_symbol_offset(buf, name); // elf interpreter debug path
+  }
+  return offset;
+}
+
+static void patchLibc(int fd, char *base, char *glibc)
+{
+  assert(base != NULL);
+  assert(fd > 0);
+  DLOG(NOISE, "Patching libc (%s) @ %p\n", glibc, base);
+  // Save incoming offset
+  off_t save_offset = lseek(fd, 0, SEEK_CUR);
+  off_t mmap_offset = libc_symbol_offset(glibc, "mmap");
+  assert(mmap_offset);
+  off_t munmap_offset = libc_symbol_offset(glibc, "munmap");
+  assert(munmap_offset);
+  off_t mremap_offset = libc_symbol_offset(glibc, "mremap");
+  assert(mremap_offset);
+  patch_trampoline(base + mmap_offset, reinterpret_cast<void*>(&mmap_wrapper));
+  patch_trampoline(base + munmap_offset, reinterpret_cast<void*>(&munmap_wrapper));
+  patch_trampoline(base + mremap_offset,
+                   reinterpret_cast<void*>(&mremap_wrapper));
+  off_t exit_offset = get_symbol_offset(glibc, "_exit");
+  if (exit_offset) {
+    patch_trampoline(base + exit_offset, reinterpret_cast<void*>(&uhExit));
+  } else {
+    DLOG(ERROR, "No _exit in %s: the lower half's exit handlers won't run\n",
+         glibc);
+  }
+  // Restore file offset to not upset the caller
+  lseek(fd, save_offset, SEEK_SET);
+}
+
+// We don't need a wrapper for sbrk() because DMTCP has created a page above here
+// to make sbrk(0) fail in libc/application.
