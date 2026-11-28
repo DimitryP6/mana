@@ -1,0 +1,96 @@
+# @configure_input@
+
+# The compilers and flags found by configure.  Without CC here, make uses cc,
+# which is the Cray compiler wrapper on some Cray systems.
+CC = @CC@
+CXXFLAGS = @CXXFLAGS@
+FFLAGS = ${CXXFLAGS} @FFLAGS@
+MPICC = @MPICC@
+MPICXX = @MPICXX@
+MPIFC = @MPIFC@
+MPI_CFLAGS?= @CFLAGS@ -g3 -fPIC
+MPI_LDFLAGS?=
+
+###############################################################
+# NOTE:  More Fortran/C examples (under LGPL license) at:
+#        https://people.math.sc.edu/Burkardt/f_src/mpi/mpi.html
+###############################################################
+
+default: default_prereqs
+	+ $(MAKE) e2e
+
+# End-to-end tests, run by autotest.py natively and under MANA.  Each test is
+# one program, named after the test and linked as any MPI program.
+E2E_TESTS = p2p_blocking p2p_nonblocking p2p_ring p2p_any_source p2p_probe \
+            p2p_large p2p_proc_null collectives nonblocking_collectives \
+            communicators cartesian datatypes memory init_thread \
+            exit_after_finalize attributes misc_calls \
+            finalize_unsync abort p2p_ssend p2p_ssend_sync \
+            p2p_ssend_collective p2p_ssend_probe p2p_ssend_wildcard \
+            p2p_ssend_order p2p_ssend_comm p2p_ssend_blocked \
+            p2p_issend_envelope p2p_issend_twice p2p_issend_nbx \
+            shared_memory mmap_threads comm_free keyvals realloc_grow \
+            nbc_order comm_self comm_create_group comm_free_order \
+            p2p_issend_comm_free
+E2E_FORTRAN = fortran_p2p fortran_nonblocking fortran_handles fortran_attributes
+
+# CUDA-aware MPI tests (run under mana_launch --cuda); built if nvcc is there.
+NVCC ?= $(shell command -v nvcc 2>/dev/null)
+E2E_CUDA = $(if $(NVCC),cuda_aware cuda_ordering)
+
+# The suite also runs the example of ../examples (ring_example).
+e2e: ${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi ${E2E_CUDA}
+	+ $(MAKE) -C ../examples
+
+# With the shared CUDA runtime, as most applications use (a static one works
+# too).
+cuda_aware cuda_ordering: %: %.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
+	  $(CUDA_LIBS)
+cuda_ordering: CUDA_LIBS = -lcuda
+
+${E2E_TESTS}: %: %.c mana_test.h
+	$(MPICC) -g3 -O0 -o $@ $< $(MPI_CFLAGS) ${MPI_LDFLAGS}
+
+mmap_threads: MPI_LDFLAGS += -pthread
+
+# Opens the MPI library with dlopen(), so it is not linked with it.
+dlopen_mpi: dlopen_mpi.c
+	$(MPICC) -g3 -O0 -c -o $@.o $< $(MPI_CFLAGS)
+	$(CC) -g3 -o $@ $@.o -ldl
+
+${E2E_FORTRAN}: %: %.f90
+	$(MPIFC) ${FFLAGS} -g3 -O0 -o $@ $<
+
+check: e2e
+	./autotest.py
+
+default_prereqs:
+	@ # The darshan module is used at NERSC.
+	@ if command -v module >/dev/null && module list 2>&1| grep -q darshan;\
+	  then \
+	    echo '** DMTCP is incompatible with the darshan module.'; \
+	    echo '** Please do "module unload darshan" before building DMTCP.';\
+	    exit 1; \
+	fi
+	@ # The altd module is used at NERSC.
+	@ if command -v module >/dev/null && module list 2>&1| grep -q altd;\
+	  then \
+	    echo '** DMTCP is incompatible with the altd module.'; \
+	    echo '** Please do "module unload altd" before building DMTCP.';\
+	    exit 1; \
+	fi
+
+tidy:
+	rm -f ckpt_*.dmtcp dmtcp_restart_script* \
+	dmtcp-shared-memory.* dmtcp-test-typescript.tmp core*
+	rm -rf ckpt_*
+	rm -f dmtcp_coordinator_db-*.json
+
+clean: tidy
+	rm -f *.pyc *.so
+	rm -f ${E2E_TESTS} ${E2E_FORTRAN} cuda_aware cuda_ordering
+
+# Regenerate this Makefile when Makefile.in or config.status is newer.
+Makefile: Makefile.in @top_builddir@/config.status
+	cd @top_builddir@ && ./config.status test/Makefile

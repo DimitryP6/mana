@@ -1,0 +1,556 @@
+#include <mpi.h>
+
+#include <map>
+#include <unordered_set>
+#include <vector>
+#include <string.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+#include "dmtcp.h"
+#include "dmtcp_assert.h"
+#include "jconvert.h"
+#include "kvdb.h"
+#include "lower_half_ckpt.h"
+#include "seq_num.h"
+#include "mpi_nextfunc.h"
+#include "virtual_id.h"
+
+using dmtcp::kvdb::KVDBRequest;
+using dmtcp::kvdb::KVDBResponse;
+
+// #define DEBUG_SEQ_NUM
+
+constexpr int MAX_DRAIN_ROUNDS = 200;
+
+extern "C" int MPI_Iprobe_internal(int source, int tag, MPI_Comm comm,
+                                   int *flag, MPI_Status *status);
+extern "C" int MPI_Test_internal(MPI_Request *request, int *flag,
+                                 MPI_Status *status, bool isRealRequest);
+
+extern int g_world_rank;
+extern int g_world_size;
+// Global communicator for MANA internal use
+MPI_Comm g_world_comm;
+volatile bool ckpt_pending;
+int converged;
+volatile phase_t current_phase = IS_READY;
+int num_converged;
+pthread_mutex_t seq_num_lock;
+// The clocks of this process, by gid.  The descriptor of a communicator
+// points to its clock.
+static std::unordered_map<uint64_t, comm_clock> clocks;
+// The gids of the clocks whose targets this process raised in the current
+// drain attempt.  The next drain round uploads their sequence numbers.
+static std::vector<uint64_t> raised_clocks;
+// True if this process added a clock in the current drain attempt, after the
+// attempt shared the sequence numbers.
+static bool added_clock;
+// Counts the downloads of targets.  A process that waits for a drain checks its
+// targets again only after one.
+static unsigned long targets_version;
+
+// A communicator that this process freed.  Its real free waits for its
+// MPI_Comm_free barrier: an MPI_Ibarrier that each member starts on the
+// communicator in MPI_Comm_free.
+struct pending_free {
+  uint64_t gid;
+  MPI_Comm real_comm;
+  MPI_Request request;
+};
+static std::vector<pending_free> pending_frees;
+
+void seq_num_init() {
+  ckpt_pending = false;
+  pthread_mutex_init(&seq_num_lock, NULL);
+}
+
+void seq_num_destroy() {
+  pthread_mutex_destroy(&seq_num_lock);
+}
+
+void seq_num_reset() {
+  ckpt_pending = false;
+}
+
+void print_seq_nums() {
+  for (auto &pair : clocks) {
+    printf("%d, %lu, %lu\n", g_world_rank, pair.first, pair.second.seq);
+  }
+  fflush(stdout);
+}
+
+int check_seq_nums() {
+  int target_reached = 1;
+  for (auto &pair : clocks) {
+    if (pair.second.target > pair.second.seq) {
+      target_reached = 0;
+      break;
+    }
+  }
+  return target_reached;
+}
+
+comm_clock*
+add_comm_clock(uint64_t gid)
+{
+  pthread_mutex_lock(&seq_num_lock);
+  auto inserted = clocks.emplace(gid, comm_clock{0, 0});
+  ASSERT(inserted.second, "Two communicators have the gid {}", gid);
+  comm_clock *clock = &inserted.first->second;
+  if (ckpt_pending) {
+    added_clock = true;
+  }
+  pthread_mutex_unlock(&seq_num_lock);
+  return clock;
+}
+
+// Lets the MPI library make progress while this process waits for a drain.
+// The other members may wait for a non-blocking collective that this process
+// started.  The MPI library progresses that collective only during MPI calls.
+static void
+progress_mpi()
+{
+  MPI_Status status;
+  int flag;
+  MPI_Iprobe_internal(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag,
+                      &status);
+}
+
+// Waits while a drain attempt runs and this process has reached all its
+// targets.  Call it under seq_num_lock.  Only a download of targets, or the
+// end of the attempt, can end the wait.  So it checks the targets again only
+// after a download, and spins without the lock until then.
+static void
+wait_while_targets_reached()
+{
+  while (ckpt_pending && check_seq_nums()) {
+    unsigned long version = targets_version;
+    pthread_mutex_unlock(&seq_num_lock);
+    do {
+      progress_mpi();
+    } while (ckpt_pending &&
+             __atomic_load_n(&targets_version, __ATOMIC_RELAXED) == version);
+    pthread_mutex_lock(&seq_num_lock);
+  }
+}
+
+void
+begin_critical_section(MPI_Comm comm, bool counted)
+{
+  // NULL if 'counted' is false, or for an invalid handle, which the MPI call
+  // then reports.
+  mana_comm_desc *desc = counted ? get_comm_desc(comm) : NULL;
+  // Checking ckpt_pending and incrementing the sequence number should be
+  // atomic.  drain_mpi_collective() sets ckpt_pending and shares the
+  // sequence numbers under this lock.
+  pthread_mutex_lock(&seq_num_lock);
+  wait_while_targets_reached();
+  current_phase = IN_CS;
+  if (desc == NULL) {
+    pthread_mutex_unlock(&seq_num_lock);
+    return;
+  }
+  comm_clock *clock = desc->clock;
+  clock->seq++;
+  // This process passed its target.  The next drain round uploads the new
+  // target for the other members.
+  if (ckpt_pending && clock->seq > clock->target) {
+    clock->target = clock->seq;
+    if (desc->size > 1) {
+      raised_clocks.push_back(desc->gid);
+    }
+  }
+  pthread_mutex_unlock(&seq_num_lock);
+}
+
+void commit_begin(MPI_Comm comm) {
+  if (comm == MPI_COMM_NULL) {
+    return;
+  }
+  begin_critical_section(comm, true);
+}
+
+void commit_finish(MPI_Comm comm) {
+  current_phase = IS_READY;
+  if (ckpt_pending) {
+    pthread_mutex_lock(&seq_num_lock);
+    wait_while_targets_reached();
+    pthread_mutex_unlock(&seq_num_lock);
+  }
+  // Each collective call frees the communicators whose MPI_Comm_free barriers
+  // completed, also on a process that frees no more communicators.
+  if (!pending_frees.empty()) {
+    LOWER_HALF_DISABLE_CKPT();
+    test_comm_free_barriers();
+    LOWER_HALF_ENABLE_CKPT();
+  }
+}
+
+// Uploads 'seq', the sequence number of the clock 'gid', to the KVDB 'db',
+// which keeps the maximum of the uploads.
+static void
+upload_seq(const char *db, uint64_t gid, unsigned long seq)
+{
+  dmtcp::string comm_id_str(jalib::XToString(gid));
+  ASSERT(dmtcp::kvdb::request64(KVDBRequest::MAX, db, comm_id_str,
+                                (int64_t)seq) == KVDBResponse::SUCCESS,
+         "db={} key={}", db, comm_id_str);
+}
+
+void
+upload_seq_num(const char *db)
+{
+  for (auto &pair : clocks) {
+    upload_seq(db, pair.first, pair.second.seq);
+  }
+}
+
+// Sets the target of each clock to its value in the KVDB 'db'.  A clock keeps
+// its target if the KVDB has no value for it.  That is so for a clock that no
+// process had at the start of the attempt and whose target no process raised.
+void
+download_targets(const char *db)
+{
+  int64_t max_seq = 0;
+  for (auto &pair : clocks) {
+    dmtcp::string comm_id_str(jalib::XToString(pair.first));
+    KVDBResponse rc = dmtcp::kvdb::get64(db, comm_id_str, &max_seq);
+    ASSERT(rc == KVDBResponse::SUCCESS || rc == KVDBResponse::KEY_NOT_FOUND,
+           "db={} key={} rc={}", db, comm_id_str, rc);
+    if (rc == KVDBResponse::SUCCESS) {
+      pair.second.target = max_seq;
+    }
+  }
+  __atomic_add_fetch(&targets_version, 1, __ATOMIC_RELAXED);
+}
+
+// The KVDB key of entry 'i' in the list of the gids that a drain round raised.
+static void
+raised_entry_key(char *buf, size_t size, const char *round_key, int64_t i)
+{
+  snprintf(buf, size, "%s-%lld", round_key, (long long)i);
+}
+
+// Uploads the sequence number of each clock in raised_clocks to the KVDB 'db'.
+// It also adds the gids to the round's list in 'list_db', whose length is the
+// value of 'round_key' in 'count_db'.  Then it empties raised_clocks.
+static void
+upload_raised_targets(const char *db, const char *list_db,
+                      const char *count_db, const char *round_key)
+{
+  std::vector<uint64_t> gids;
+  // raised_clocks has a clock once for each call that raised its target.
+  std::unordered_set<uint64_t> uploaded;
+  for (uint64_t gid : raised_clocks) {
+    std::unordered_map<uint64_t, comm_clock>::iterator it = clocks.find(gid);
+    if (it == clocks.end() || !uploaded.insert(gid).second) {
+      continue;
+    }
+    upload_seq(db, gid, it->second.seq);
+    gids.push_back(gid);
+  }
+  raised_clocks.clear();
+  int64_t first = 0;
+  ASSERT(dmtcp::kvdb::request64(KVDBRequest::INCRBY, count_db, round_key,
+                                gids.size(), &first) == KVDBResponse::SUCCESS,
+         "db={} key={}", count_db, round_key);
+  for (size_t i = 0; i < gids.size(); i++) {
+    char entry[64];
+    raised_entry_key(entry, sizeof(entry), round_key, first + i);
+    ASSERT(dmtcp::kvdb::set64(list_db, entry, (int64_t)gids[i]) ==
+             KVDBResponse::SUCCESS,
+           "db={} key={}", list_db, entry);
+  }
+}
+
+// Downloads the targets of the clocks in the round's list of raised gids (see
+// upload_raised_targets()), which has 'raised' entries.  If the list is not
+// shorter than the clocks of this process, it downloads all targets.
+static void
+download_raised_targets(const char *db, const char *list_db,
+                        const char *round_key, int64_t raised)
+{
+  if (raised >= (int64_t)clocks.size()) {
+    download_targets(db);
+    return;
+  }
+  std::unordered_set<uint64_t> downloaded;
+  for (int64_t i = 0; i < raised; i++) {
+    char entry[64];
+    raised_entry_key(entry, sizeof(entry), round_key, i);
+    int64_t gid = 0;
+    ASSERT(dmtcp::kvdb::get64(list_db, entry, &gid) == KVDBResponse::SUCCESS,
+           "db={} key={}", list_db, entry);
+    std::unordered_map<uint64_t, comm_clock>::iterator it = clocks.find(gid);
+    if (it == clocks.end() || !downloaded.insert(gid).second) {
+      continue;
+    }
+    dmtcp::string comm_id_str(jalib::XToString((uint64_t)gid));
+    int64_t max_seq = 0;
+    ASSERT(dmtcp::kvdb::get64(db, comm_id_str, &max_seq) ==
+             KVDBResponse::SUCCESS,
+           "db={} key={}", db, comm_id_str);
+    it->second.target = max_seq;
+  }
+  __atomic_add_fetch(&targets_version, 1, __ATOMIC_RELAXED);
+}
+
+int
+start_comm_free_barrier(uint64_t gid, MPI_Comm real_comm)
+{
+  pending_free f = {gid, real_comm, lh_info->MANA_REQUEST_NULL};
+  int retval;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Ibarrier)(real_comm, &f.request);
+  RETURN_TO_UPPER_HALF();
+  if (retval == MPI_SUCCESS) {
+    pending_frees.push_back(f);
+  }
+  return retval;
+}
+
+// Tests the MPI_Comm_free barrier of 'f' once, or until it completes if
+// 'wait'.  When it completes, every member started its MPI_Comm_free: this
+// function then frees the real communicator, erases the clock and returns
+// true.
+static bool
+finish_free(pending_free *f, bool wait)
+{
+  int flag = 0;
+  int retval;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  do {
+    retval = NEXT_FUNC(Test)(&f->request, &flag, MPI_STATUS_IGNORE);
+  } while (retval == MPI_SUCCESS && wait && !flag);
+  if (retval == MPI_SUCCESS && flag) {
+    retval = NEXT_FUNC(Comm_free)(&f->real_comm);
+  }
+  RETURN_TO_UPPER_HALF();
+  ASSERT(retval == MPI_SUCCESS,
+         "Freeing a communicator after its barrier failed: gid={} rc={}",
+         f->gid, retval);
+  if (flag) {
+    pthread_mutex_lock(&seq_num_lock);
+    clocks.erase(f->gid);
+    pthread_mutex_unlock(&seq_num_lock);
+  }
+  return flag;
+}
+
+void
+test_comm_free_barriers()
+{
+  for (size_t i = 0; i < pending_frees.size();) {
+    if (finish_free(&pending_frees[i], false)) {
+      pending_frees.erase(pending_frees.begin() + i);
+    } else {
+      i++;
+    }
+  }
+}
+
+void
+complete_comm_free_barriers()
+{
+  for (pending_free &f : pending_frees) {
+    finish_free(&f, true);
+  }
+  pending_frees.clear();
+}
+
+// Writes the KVDB name "/plugin/MANA/<what>-<start>-<generation>" to buf,
+// with "-<attempt>" appended if attempt >= 0: <start> is when the computation
+// started, and <generation> is the checkpoint's.  The coordinator keeps its
+// KVDB across checkpoints, and across computations, until a restart, so each
+// checkpoint needs names of its own.  Every rank has both values from the
+// coordinator before DMTCP_EVENT_PRESUSPEND.  Fails if the name is longer
+// than 63 characters, where DMTCP would truncate it.
+void
+ckpt_kvdb_name(char *buf, size_t size, const char *what, int attempt)
+{
+  DmtcpUniqueProcessId id = dmtcp_get_computation_id();
+  unsigned long long start = id._time;
+  unsigned int generation = id._computation_generation;
+  int n = attempt < 0
+    ? snprintf(buf, size, "/plugin/MANA/%s-%llx-%u", what, start, generation)
+    : snprintf(buf, size, "/plugin/MANA/%s-%llx-%u-%06d", what, start,
+               generation, attempt);
+  // DMTCP silently truncates a KVDB name at 63 characters (kvdbId).
+  ASSERT(n > 0 && n < 64 && (size_t)n < size, "KVDB name too long: {}", buf);
+}
+
+void
+share_seq_nums(int attemptId)
+{
+  char db[64] = { 0 };
+  char barrier[64] = { 0 };
+  ckpt_kvdb_name(db, sizeof(db), "comm-seq-max", attemptId);
+  snprintf(barrier, 63, "MANA-SHARE-SEQ-NUM-%06d", attemptId);
+
+  upload_seq_num(db);
+  dmtcp_global_barrier(barrier);
+  download_targets(db);
+}
+
+static bool
+try_drain_mpi_collective(int attemptId)
+{
+  int round_num = 0;
+  int64_t num_converged = 0;
+  int64_t in_cs = 0;
+  int64_t raised = 0;
+  char db[64] = { 0 };
+  ckpt_kvdb_name(db, sizeof(db), "comm-seq-max", attemptId);
+
+  // The attempt fails after MAX_DRAIN_ROUNDS rounds in a row in which no
+  // process raised a target.  The other members see a raised target only in
+  // the next round, so a chain of raises takes one round for each raise.
+  int rounds_without_raise = 0;
+  while (rounds_without_raise < MAX_DRAIN_ROUNDS) {
+    char key[64] = { 0 };
+    char barrier_id[64] = { 0 };
+    char cs_id[64] = { 0 };
+    char converge_id[64] = { 0 };
+    char raised_id[64] = { 0 };
+    char list_id[64] = { 0 };
+
+    ckpt_kvdb_name(cs_id, sizeof(cs_id), "CRITICAL-SECTION", attemptId);
+    ckpt_kvdb_name(converge_id, sizeof(converge_id), "CONVERGE", attemptId);
+    ckpt_kvdb_name(raised_id, sizeof(raised_id), "TARGETS-RAISED", attemptId);
+    ckpt_kvdb_name(list_id, sizeof(list_id), "RAISED-GIDS", attemptId);
+    snprintf(barrier_id, 63, "MANA-PRESUSPEND-%06d-%06d", attemptId, round_num);
+    snprintf(key, 63, "round-%06d", round_num);
+
+    // An application thread can raise a target, add a clock or erase a clock
+    // at the same time.  The other members may have shared a higher sequence
+    // number for a clock that this process added after it shared its own.  An
+    // application thread adds a clock only in a critical section.  So a round
+    // that does not see the new clock sees the process in the critical
+    // section.
+    pthread_mutex_lock(&seq_num_lock);
+    if (added_clock) {
+      download_targets(db);
+      added_clock = false;
+    }
+    upload_raised_targets(db, list_id, raised_id, key);
+    int target_reached = check_seq_nums();
+    int cs = current_phase == IN_CS;
+    pthread_mutex_unlock(&seq_num_lock);
+
+    ASSERT(dmtcp::kvdb::request64(KVDBRequest::INCRBY, converge_id, key,
+                                  target_reached) == KVDBResponse::SUCCESS,
+           "db={} key={}", converge_id, key);
+    ASSERT(dmtcp::kvdb::request64(KVDBRequest::OR, cs_id, key, cs) ==
+             KVDBResponse::SUCCESS,
+           "db={} key={}", cs_id, key);
+
+    dmtcp_global_barrier(barrier_id);
+
+    ASSERT(dmtcp::kvdb::get64(converge_id, key, &num_converged) ==
+             KVDBResponse::SUCCESS,
+           "db={} key={}", converge_id, key);
+    ASSERT(dmtcp::kvdb::get64(cs_id, key, &in_cs) == KVDBResponse::SUCCESS,
+           "db={} key={}", cs_id, key);
+    ASSERT(dmtcp::kvdb::get64(raised_id, key, &raised) ==
+             KVDBResponse::SUCCESS,
+           "db={} key={}", raised_id, key);
+
+    // A process that reached its targets in this round can pass a target only
+    // after its targets rise.  Its targets rise only in the download below.
+    // So if no process raised a target, the drain ends.
+    if (in_cs == 0 && num_converged == g_world_size && raised == 0) {
+      return true;
+    }
+    if (raised > 0) {
+      pthread_mutex_lock(&seq_num_lock);
+      download_raised_targets(db, list_id, key, raised);
+      pthread_mutex_unlock(&seq_num_lock);
+      rounds_without_raise = 0;
+    } else {
+      rounds_without_raise++;
+    }
+
+    round_num++;
+  }
+
+  return false;
+}
+
+void
+drain_mpi_collective()
+{
+  int attemptId = 0;
+
+  while (true) {
+    // Publish our seq_num to kvdb.
+    pthread_mutex_lock(&seq_num_lock);
+    ckpt_pending = true;
+    raised_clocks.clear();
+    added_clock = false;
+    share_seq_nums(attemptId);
+    pthread_mutex_unlock(&seq_num_lock);
+
+    if (try_drain_mpi_collective(attemptId)) {
+      return;
+    }
+
+    // We couldn't drain the collective.  Let's try again after sleeping for a
+    // second. We set ckpt_pending to false to allow the user threads to
+    // continue for a bit.
+    pthread_mutex_lock(&seq_num_lock);
+    ckpt_pending = false;
+    pthread_mutex_unlock(&seq_num_lock);
+
+    sleep(1);
+
+    attemptId++;
+  }
+}
+
+// Completes the pending non-blocking collectives with MPI_Test.  Call it
+// after drain_mpi_collective(): all ranks have then initiated the same
+// collectives and commit_begin() blocks new ones, so each request completes.
+// Call it with the lower half closed, so that no application thread is in
+// MPI or tests these requests meanwhile.  The request then maps to
+// MPI_REQUEST_NULL, so the application's later MPI_Wait/MPI_Test on it
+// returns at once.  A rank that finishes first may stop calling MPI: its
+// request completes only after its own part is done.
+void
+complete_pending_nonblocking_collectives()
+{
+  for (MPI_Request request : pending_collective_requests()) {
+    int flag = 0;
+    MPI_Status status;
+    while (!flag) {
+      int rc = MPI_Test_internal(&request, &flag, &status, false);
+      ASSERT(rc == MPI_SUCCESS,
+             "MPI_Test failed on a pending non-blocking collective: rc={}", rc);
+    }
+    update_virt_id((mana_mpi_handle){.request = request},
+                   (mana_mpi_handle){.request = lh_info->MANA_REQUEST_NULL});
+  }
+}
+
+// Tests each pending non-blocking collective once, under the same conditions
+// as complete_pending_nonblocking_collectives(), and returns how many are
+// still pending.
+int
+test_pending_nonblocking_collectives()
+{
+  int pending = 0;
+  for (MPI_Request request : pending_collective_requests()) {
+    int flag = 0;
+    MPI_Status status;
+    int rc = MPI_Test_internal(&request, &flag, &status, false);
+    ASSERT(rc == MPI_SUCCESS,
+           "MPI_Test failed on a pending non-blocking collective: rc={}", rc);
+    if (flag) {
+      update_virt_id((mana_mpi_handle){.request = request},
+                     (mana_mpi_handle){.request = lh_info->MANA_REQUEST_NULL});
+    } else {
+      pending++;
+    }
+  }
+  return pending;
+}
