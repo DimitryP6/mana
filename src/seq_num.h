@@ -1,0 +1,62 @@
+#ifndef SEQ_NUM_H
+#define SEQ_NUM_H
+
+#include <mpi.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <unordered_map>
+
+typedef enum _phase_t {
+  IN_CS,
+  IS_READY
+} phase_t;
+
+// Global communicator for MANA internal use
+extern MPI_Comm g_world_comm;
+
+// The main functions of the sequence number algorithm for MPI collectives
+void commit_begin(MPI_Comm comm);
+// Waits while a drain attempt runs and this process has reached all its
+// targets.  Then it enters a critical section.  If 'counted' is true, it also
+// counts a call on the clock of 'comm'.
+void begin_critical_section(MPI_Comm comm, bool counted);
+void commit_finish(MPI_Comm comm);
+
+void drain_mpi_collective();
+void ckpt_kvdb_name(char *buf, size_t size, const char *what,
+                    int attempt = -1);
+void complete_pending_nonblocking_collectives();
+int test_pending_nonblocking_collectives();
+void share_seq_nums();
+int check_seq_nums();
+void print_seq_nums();
+void seq_num_init();
+void seq_num_reset();
+void seq_num_destroy();
+
+// The Collective Clock of a communicator on this process.  'seq', the sequence
+// number, counts the collective calls that this process made on the
+// communicator.  'target' is the number that 'seq' must reach before a
+// checkpoint.
+struct comm_clock {
+  unsigned long seq;
+  unsigned long target;
+};
+
+// Starts the MPI_Comm_free barrier of a communicator that this process freed
+// (see test_comm_free_barriers()).  'real_comm' is its lower-half handle.
+// Returns the result of MPI_Ibarrier.  If it failed, no barrier is pending.
+int start_comm_free_barrier(uint64_t gid, MPI_Comm real_comm);
+// Tests the pending MPI_Comm_free barriers.  For each one that completed,
+// frees the real communicator and erases the clock.  Call it in the lower
+// half guard.  commit_finish() calls it.
+void test_comm_free_barriers();
+// Completes the pending MPI_Comm_free barriers, like
+// complete_pending_nonblocking_collectives().  Every member of each
+// communicator must call MPI_Comm_free on it.
+void complete_comm_free_barriers();
+// Adds the clock of a new communicator, with 'seq' and 'target' at 0, and
+// returns it.
+comm_clock* add_comm_clock(uint64_t gid);
+
+#endif // ifndef SEQ_NUM_H

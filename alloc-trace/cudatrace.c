@@ -7,11 +7,18 @@
  * (cudaMalloc -> cuMemAlloc_v2), by NCCL, and by the app itself.
  *
  * Output: $ALLOC_TRACE_DIR/cuda-<host>-<pid>.csv (default: current directory)
- *   t_ns,tid,dev,api,ptr,size,extra,status,caller
+ *   t_ns,tid,dev,api,ptr,size,extra,status,caller,dur_ns
  * t_ns is CLOCK_MONOTONIC, the same clock mpitrace uses.  ptr is a device
  * address, a host address (host allocations) or a VMM handle (cuMemCreate,
  * cuMemRelease, export).  caller is the first library on the stack that is
  * not CUDA itself (set ALLOC_TRACE_CALLER=0 to skip the stack walk).
+ * dur_ns is how long the call took.
+ *
+ * ALLOC_TRACE_ALL=1 also counts and times every driver call (kernel
+ * launches, copies, ...), into $ALLOC_TRACE_DIR/api-<host>-<pid>.csv at exit:
+ *   api,calls,total_ns,wall_ns
+ * wall_ns is the time from cuInit to exit.  The callbacks for every call
+ * make each call slower by about a microsecond.
  */
 #define _GNU_SOURCE
 #include <cuda.h>
@@ -28,6 +35,17 @@
 static FILE *out;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int want_caller = 1;
+static __thread unsigned long long call_dur;   // of the call being logged
+
+// ALLOC_TRACE_ALL: every driver call's count and time, by callback id.
+static int all_apis;
+static unsigned long long t_start;
+static char api_path[4096];
+static struct {
+  const char *name;
+  unsigned long calls;
+  unsigned long long ns;
+} api_stats[CUPTI_DRIVER_TRACE_CBID_SIZE];
 
 static unsigned long long
 now_ns(void)
@@ -72,8 +90,9 @@ emit(const CUpti_CallbackData *cb, const char *api, unsigned long long ptr,
   CUresult status = *(CUresult *)cb->functionReturnValue;
   const char *who = want_caller ? caller() : "";
   pthread_mutex_lock(&lock);
-  fprintf(out, "%llu,%d,%d,%s,%#llx,%llu,%#llx,%d,%s\n", now_ns(), gettid(),
-          (int)dev, api, ptr, size, extra, (int)status, who);
+  fprintf(out, "%llu,%d,%d,%s,%#llx,%llu,%#llx,%d,%s,%llu\n", now_ns(),
+          gettid(), (int)dev, api, ptr, size, extra, (int)status, who,
+          call_dur);
   pthread_mutex_unlock(&lock);
 }
 
@@ -85,9 +104,17 @@ on_call(void *userdata, CUpti_CallbackDomain domain, CUpti_CallbackId id,
 {
   (void)userdata;
   (void)domain;
-  // Results such as the new pointer exist only once the call has returned.
-  if (cb->callbackSite != CUPTI_API_EXIT)
+  if (cb->callbackSite == CUPTI_API_ENTER) {
+    *cb->correlationData = now_ns();   // the call's start, for its exit
     return;
+  }
+  // Results such as the new pointer exist only once the call has returned.
+  call_dur = now_ns() - *cb->correlationData;
+  if (all_apis && id < CUPTI_DRIVER_TRACE_CBID_SIZE) {
+    api_stats[id].name = cb->functionName;
+    __atomic_fetch_add(&api_stats[id].calls, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&api_stats[id].ns, call_dur, __ATOMIC_RELAXED);
+  }
   const char *api = cb->functionName;
 
   switch (id) {
@@ -257,6 +284,20 @@ finish(void)
   pthread_mutex_lock(&lock);
   fflush(out);
   pthread_mutex_unlock(&lock);
+  if (!all_apis)
+    return;
+  FILE *f = fopen(api_path, "w");
+  if (!f) {
+    perror(api_path);
+    return;
+  }
+  unsigned long long wall = now_ns() - t_start;
+  fprintf(f, "api,calls,total_ns,wall_ns\n");
+  for (int i = 0; i < CUPTI_DRIVER_TRACE_CBID_SIZE; i++)
+    if (api_stats[i].calls)
+      fprintf(f, "%s,%lu,%llu,%llu\n", api_stats[i].name, api_stats[i].calls,
+              api_stats[i].ns, wall);
+  fclose(f);
 }
 
 int
@@ -264,12 +305,17 @@ InitializeInjection(void)
 {
   const char *dir = getenv("ALLOC_TRACE_DIR");
   const char *c = getenv("ALLOC_TRACE_CALLER");
+  const char *all = getenv("ALLOC_TRACE_ALL");
   char host[64] = "host", path[4096];
   gethostname(host, sizeof host);
   snprintf(path, sizeof path, "%s/cuda-%s-%d.csv", dir ? dir : ".", host,
            getpid());
   if (c && *c == '0')
     want_caller = 0;
+  all_apis = all && *all && *all != '0';
+  t_start = now_ns();
+  snprintf(api_path, sizeof api_path, "%s/api-%s-%d.csv", dir ? dir : ".",
+           host, getpid());
 
   out = fopen(path, "w");
   if (!out) {
@@ -277,7 +323,7 @@ InitializeInjection(void)
     return 0;
   }
   setvbuf(out, NULL, _IOFBF, 1 << 20);
-  fprintf(out, "t_ns,tid,dev,api,ptr,size,extra,status,caller\n");
+  fprintf(out, "t_ns,tid,dev,api,ptr,size,extra,status,caller,dur_ns\n");
   atexit(finish);
 
   CUpti_SubscriberHandle sub;
@@ -286,7 +332,10 @@ InitializeInjection(void)
     fprintf(stderr, "cudatrace: cuptiSubscribe failed (another profiler?)\n");
     return 0;
   }
-  for (size_t i = 0; i < sizeof traced / sizeof traced[0]; i++)
-    cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_DRIVER_API, traced[i]);
+  if (all_apis)
+    cuptiEnableDomain(1, sub, CUPTI_CB_DOMAIN_DRIVER_API);
+  else
+    for (size_t i = 0; i < sizeof traced / sizeof traced[0]; i++)
+      cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_DRIVER_API, traced[i]);
   return 1;
 }

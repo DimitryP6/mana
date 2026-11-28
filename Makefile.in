@@ -1,14 +1,9 @@
-LN_S=@LN_S@ -f
-MKDIR_P=@MKDIR_P@
 CC=@CC@
 CFLAGS = @CFLAGS@
 CXX=@CXX@
 CXXFLAGS = @CXXFLAGS@
-CPP=@CPP@
 CPPFLAGS = @CPPFLAGS@
 LDFLAGS = @LDFLAGS@
-PACKAGE=@PACKAGE_TARNAME@
-PACKAGE_TARNAME=@PACKAGE_TARNAME@-@PACKAGE_VERSION@
 VERSION=@PACKAGE_VERSION@
 
 # Allow the user to specify the install program.
@@ -19,19 +14,14 @@ INSTALL_SCRIPT = @INSTALL_SCRIPT@
 
 prefix=@prefix@
 exec_prefix=@exec_prefix@
-datarootdir=@datarootdir@
 bindir=@bindir@
 libdir=@libdir@
-pkglibdir = @libdir@/@PACKAGE@
-docdir=@docdir@
-includedir=@includedir@
-mandir=@mandir@
-infodir=@mandir@
+# DMTCP installs its plugins here too.
+pkglibdir = $(libdir)/dmtcp
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
 srcdir = @srcdir@
 VPATH = @srcdir@
-targetdir = $(top_builddir)
 
 INSTALL_FLAGS = install
 UNINSTALL_FLAGS = uninstall
@@ -39,48 +29,85 @@ UNINSTALL_FLAGS = uninstall
 # If 'DMTCP_ROOT' env. var. is defined, use that instead of dmtcp submodule.
 DMTCP_ROOT ?= $(top_builddir)/dmtcp
 
-# Macros TEST and XTERM_E used on command line by check1, check2, ...:
-#   make TEST=readline XTERM_E="xterm -e" check-readline
-
 default: display-build-env add-git-hooks mana_prereqs
 	$(MAKE) mana
 
 all: default
 
-mana: mana_prereqs dmtcp
-	cd mpi-proxy-split && $(MAKE) install && $(MAKE) -j tests
+MANA_SCRIPTS = mana_coordinator mana_launch mana_restart mana_status
+
+mana: mana_prereqs dmtcp $(MANA_SCRIPTS:%=bin/%)
+	cd src && $(MAKE) stage
+
+# bin/ holds the scripts next to DMTCP's programs and the lower half, which
+# the scripts run.
+$(MANA_SCRIPTS:%=bin/%): bin/%: scripts/%
+	@mkdir -p bin
+	cp -f $< $@
+
+# The end-to-end tests, the example and the benchmarks.
+tests:
+	cd test && $(MAKE)
+	cd examples && $(MAKE)
+	cd bench && $(MAKE)
+
+# Builds the end-to-end tests and runs them (test/autotest.py).
+check: mana
+	cd test && $(MAKE) check
 
 dmtcp: dmtcp/configure
+	@ # A 'git pull' can change the DMTCP commit that MANA uses, and it
+	@ # leaves dmtcp/ at the old commit.  'git submodule status' marks that
+	@ # with a '+'.
+	@ if test "${DMTCP_ROOT}" = "$(top_builddir)/dmtcp" && \
+	     git submodule status dmtcp 2>/dev/null | grep -q '^+'; then \
+	    echo '** Warning: dmtcp/ is not at the DMTCP commit that MANA uses.'; \
+	    echo '**   To check out that commit, do: git submodule update dmtcp'; \
+	  fi
 	cd ${DMTCP_ROOT} && $(MAKE)
 	cp -rf ${DMTCP_ROOT}/bin .
 	cp -rf ${DMTCP_ROOT}/lib .
 
-create-dirs:
-	$(INSTALL) -d $(DESTDIR)$(bindir)
-	$(INSTALL) -d $(DESTDIR)$(libdir)
-	$(INSTALL) -d $(DESTDIR)$(pkglibdir)
-	$(INSTALL) -d $(DESTDIR)$(includedir)
-	$(INSTALL) -d $(DESTDIR)$(docdir)
-	$(INSTALL) -d $(DESTDIR)$(mandir)/man1
+# MANA's scripts find the lower half, DMTCP's programs and MANA's libraries
+# from their own directory: in it and in ../lib/dmtcp.  So MANA works when
+# bindir and libdir are configure's defaults, PREFIX/bin and PREFIX/lib.
+MANA_LIBS = libmana.so libmpistub.so libmpistub_audit.so
 
-install: all create-dirs
-	cd ${DMTCP_ROOT} && make DESTDIR=$(DESTDIR) $(INSTALL_FLAGS)
-	cd mpi-proxy-split && make DESTDIR=$(DESTDIR) $(INSTALL_FLAGS)
-	cd manpages && make DESTDIR=$(DESTDIR) $(INSTALL_FLAGS)
+install: all
+	cd ${DMTCP_ROOT} && $(MAKE) DESTDIR=$(DESTDIR) $(INSTALL_FLAGS)
+	$(INSTALL) -d $(DESTDIR)$(bindir) $(DESTDIR)$(pkglibdir)
+	$(INSTALL_SCRIPT) $(MANA_SCRIPTS:%=scripts/%) $(DESTDIR)$(bindir)
+	$(INSTALL_PROGRAM) bin/lower-half $(DESTDIR)$(bindir)
+	$(INSTALL_PROGRAM) $(MANA_LIBS:%=lib/dmtcp/%) $(DESTDIR)$(pkglibdir)
+	@ # CUDA-aware MPI (mana_launch --cuda), if it was built.
+	if [ -d lib/dmtcp/cuda-forward ]; then \
+	  $(INSTALL) -d $(DESTDIR)$(pkglibdir)/cuda-forward && \
+	  cp -df lib/dmtcp/cuda-forward/* $(DESTDIR)$(pkglibdir)/cuda-forward/ && \
+	  $(INSTALL_PROGRAM) lib/dmtcp/libdmtcp_cuda.so \
+	    lib/dmtcp/libmana_cuda_vmm.so $(DESTDIR)$(pkglibdir); \
+	fi
+	cd manpages && $(MAKE) DESTDIR=$(DESTDIR) $(INSTALL_FLAGS)
 
+# In the reverse order of 'install'.  Quote each path: a space in it must
+# not split it into other files' names.
 uninstall:
-	cd ${DMTCP_ROOT} && make DESTDIR=$(DESTDIR) $(UNINSTALL_FLAGS)
-	cd mpi-proxy-split && make DESTDIR=$(DESTDIR) $(UNINSTALL_FLAGS)
-	cd manpages && make DESTDIR=$(DESTDIR) $(UNINSTALL_FLAGS)
+	cd manpages && $(MAKE) DESTDIR=$(DESTDIR) $(UNINSTALL_FLAGS)
+	for f in $(MANA_SCRIPTS) lower-half; do rm -f "$(DESTDIR)$(bindir)/$$f"; done
+	for f in $(MANA_LIBS); do rm -f "$(DESTDIR)$(pkglibdir)/$$f"; done
+	rm -f "$(DESTDIR)$(pkglibdir)/libdmtcp_cuda.so" \
+	  "$(DESTDIR)$(pkglibdir)/libmana_cuda_vmm.so"
+	rm -rf "$(DESTDIR)$(pkglibdir)/cuda-forward"
+	cd ${DMTCP_ROOT} && $(MAKE) DESTDIR=$(DESTDIR) $(UNINSTALL_FLAGS)
 
 distclean: clean
 	- cd ${DMTCP_ROOT} && $(MAKE) distclean
-	- cd mpi-proxy-split && $(MAKE) distclean
+	- cd src && $(MAKE) distclean
 	- cd manpages && $(MAKE) distclean
 	rm -f Makefile config.log config.status config.status-* config.cache
+	rm -f src/Makefile src/lower-half/Makefile src/mpi-wrappers/Makefile \
+	  test/Makefile examples/Makefile bench/Makefile
 	rm -rf autom4te.cache
-	rm -rf $(top_builddir)/lib
-	- cd $(top_builddir)/bin && find . \! -name '*mana*' -delete
+	rm -rf $(top_builddir)/lib $(top_builddir)/bin
 
 tidy:
 	rm -rf ckpt_rank*
@@ -88,7 +115,7 @@ tidy:
 	rm -f dmtcp_coordinator_db-*.json
 
 clean: tidy
-	cd mpi-proxy-split && $(MAKE) clean
+	cd src && $(MAKE) clean
 
 mana_prereqs:
 	@ if test -n "$$HUGETLB_DEFAULT_PAGE_SIZE"; then \
@@ -146,18 +173,17 @@ display-config:
 
 
 _hooksdir=.git/hooks
-add-git-hooks: ${_hooksdir}/pre-commit ${_hooksdir}/post-rewrite
+add-git-hooks: ${_hooksdir}/pre-commit
 
 ${_hooksdir}/%: util/hooks/%
 	if test -d ${_hooksdir}; then \
 	  cd ${_hooksdir} && ln -s ../../$< . ; \
 	fi
 
-# src/Makefile tries to make this, to ensure that configure, config.status,
-#   and so on are up to date.  It's assuming that this directory is also
-#   under control of automake.  So, we add this stub to satisfy automake.
-am--refresh:
-
-.PHONY: default all add-git-hooks \
+.PHONY: default all mana tests check add-git-hooks \
 	display-build-env display-release display-config \
 	dmtcp clean
+
+# Regenerate this Makefile when Makefile.in or config.status is newer.
+Makefile: Makefile.in config.status
+	./config.status Makefile

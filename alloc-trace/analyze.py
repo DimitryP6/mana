@@ -11,7 +11,9 @@ Reports, over all traced processes:
   * when allocations happen (startup only, or throughout the run) and how
     long they live;
   * which libraries make them;
-  * which allocations IPC exports, and which memory MPI calls send from.
+  * which allocations IPC exports, and which memory MPI calls send from;
+  * how long the traced driver calls take (dur_ns), and with
+    ALLOC_TRACE_ALL=1, the calls and time of every driver API (api-*.csv).
 """
 import argparse
 import bisect
@@ -80,6 +82,10 @@ class Proc:
         self.pid, self.args = pid, args
         self.rank = int(mpi_rows[0]["rank"]) if mpi_rows else None
         self.api_count = collections.Counter(r["api"] for r in cuda_rows)
+        self.api_ns = collections.Counter()
+        for r in cuda_rows:
+            if r.get("dur_ns"):
+                self.api_ns[r["api"]] += int(r["dur_ns"])
         self.allocs, self.ipc, self.mpi = [], [], []
         self.peak_req = self.peak_round = 0
         events = [(int(r["t_ns"]), 0, r) for r in cuda_rows] + \
@@ -152,6 +158,37 @@ def load(directory):
     return procs
 
 
+def load_api(directory):
+    """The api-*.csv summaries (ALLOC_TRACE_ALL=1): {api: [calls, ns]} over
+    all processes, and their wall times summed."""
+    apis = collections.defaultdict(lambda: [0, 0])
+    wall = 0
+    for path in glob.glob(os.path.join(directory, "api-*.csv")):
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        for r in rows:
+            apis[r["api"]][0] += int(r["calls"])
+            apis[r["api"]][1] += int(r["total_ns"])
+        if rows:
+            wall += int(rows[0]["wall_ns"])
+    return apis, wall
+
+
+def report_api(apis, wall, top):
+    section("all driver API calls (ALLOC_TRACE_ALL=1), summed over processes")
+    rows = sorted(apis.items(), key=lambda kv: -kv[1][1])
+    table([("api", "calls", "total ms", "mean us", "% of wall")] +
+          [(api, n, f"{t / 1e6:.3f}", f"{t / 1e3 / n:.2f}",
+            f"{100 * t / wall:.3f}" if wall else "-")
+           for api, (n, t) in rows[:top]])
+    if len(rows) > top:
+        print(f"  ... {len(rows) - top} more (--top)")
+    t = sum(v[1] for v in apis.values())
+    print(f"  all driver calls: {sum(v[0] for v in apis.values())} calls,"
+          f" {t / 1e6:.3f} ms, {100 * t / wall:.2f}% of {wall / 1e9:.3f} s"
+          " of wall time" if wall else "")
+
+
 def section(title):
     print(f"\n== {title}")
 
@@ -185,6 +222,15 @@ def report(procs, args):
     for p in procs:
         total.update(p.api_count)
     table(sorted(total.items(), key=lambda kv: -kv[1]))
+
+    ns = collections.Counter()
+    for p in procs:
+        ns.update(p.api_ns)
+    if ns:
+        section("time in the traced driver calls (dur_ns)")
+        table([("api", "calls", "total ms", "mean us")] +
+              [(api, total[api], f"{t / 1e6:.3f}", f"{t / 1e3 / total[api]:.2f}")
+               for api, t in sorted(ns.items(), key=lambda kv: -kv[1])])
 
     section("allocations by kind")
     kinds = collections.defaultdict(list)
@@ -282,19 +328,25 @@ def main():
                     help="message size from which UCX uses cuda_ipc")
     ap.add_argument("--per-proc", action="store_true",
                     help="also print a full report for each process")
+    ap.add_argument("--top", type=int, default=25,
+                    help="APIs to list from api-*.csv (default 25)")
     args = ap.parse_args()
 
     raw = load(args.dir)
-    if not raw:
-        raise SystemExit(f"no cuda-*.csv or mpi-*.csv in {args.dir}")
-    procs = [Proc(pid, c, m, args) for pid, (c, m) in sorted(raw.items())]
-    print(f"### all {len(procs)} processes")
-    report(procs, args)
-    if args.per_proc:
-        for p in procs:
-            print(f"\n### pid {p.pid}" +
-                  ("" if p.rank is None else f" (rank {p.rank})"))
-            report([p], args)
+    apis, wall = load_api(args.dir)
+    if not raw and not apis:
+        raise SystemExit(f"no cuda-*.csv, mpi-*.csv or api-*.csv in {args.dir}")
+    if raw:
+        procs = [Proc(pid, c, m, args) for pid, (c, m) in sorted(raw.items())]
+        print(f"### all {len(procs)} processes")
+        report(procs, args)
+        if args.per_proc:
+            for p in procs:
+                print(f"\n### pid {p.pid}" +
+                      ("" if p.rank is None else f" (rank {p.rank})"))
+                report([p], args)
+    if apis:
+        report_api(apis, wall, args.top)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,131 @@
+# @configure_input@
+
+# The compilers and flags that configure found.
+CFLAGS = @CFLAGS@
+CXXFLAGS = @CXXFLAGS@
+MPICC = @MPICC@
+MPICXX = @MPICXX@ -std=c++20
+
+# These are needed for libmana.so, since the wrapper functions there will
+# call the lower half.  That requires temporarily changing the FS register,
+# and apparently, glibc detects this as an attempt to do stack smashing.
+override CFLAGS += -fno-stack-protector
+override CXXFLAGS += -fno-stack-protector
+
+# Targets to stage:
+#   libmana.so (using mpi-wrappers/libmpiwrappers.a), libmpistub.so,
+#   libmpistub_audit.so
+
+# Subdirectories needed to stage
+# CUDA-aware MPI (mana_launch --cuda; cuda-forward/README.md) is built if
+# there are cuda.h and libcuda.so.1.
+CUDA_HOME ?= $(shell d=$$(dirname $$(command -v nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc))/..; echo $$d)
+HAVE_CUDA = $(and $(wildcard $(CUDA_HOME)/include/cuda.h),$(shell /sbin/ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1 ' && echo yes))
+
+LOWER_HALF_SRCDIR=lower-half
+WRAPPERS_SRCDIR=mpi-wrappers
+
+# As you add new files to your plugin library, add the object file names here.
+
+LIBOBJS = uh_wrappers.o mana_cuda.o mpi_plugin.o p2p_drain.o \
+          seq_num.o virtual_id.o lower_half_ckpt.o \
+          lower-half/switch-context.o \
+
+# MANA_ROOT and DMTCP_ROOT in the environment replace these.
+ifndef MANA_ROOT
+  MANA_ROOT=@top_srcdir@
+endif
+ifndef DMTCP_ROOT
+  DMTCP_ROOT=${MANA_ROOT}/dmtcp
+endif
+DMTCP_INCLUDE=${DMTCP_ROOT}/include
+JALIB_INCLUDE=${DMTCP_ROOT}/jalib
+
+override CFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${LOWER_HALF_SRCDIR}
+override CXXFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${JALIB_INCLUDE} \
+                     -I${WRAPPERS_SRCDIR} -I. \
+                     -I${DMTCP_ROOT}/src -I${LOWER_HALF_SRCDIR}
+# The upper half has no MPI library, so leave out the C++ bindings that
+# mpi.h declares in C++ (Open MPI 4.1: MPI::Datatype::Free(), ...), whose
+# code is in libmpi_cxx.so.
+override CXXFLAGS += -DOMPI_SKIP_MPICXX -DMPICH_SKIP_MPICXX
+
+# 'make' builds libmana.so, the stubs and the lower half, and stages them:
+# it copies them into ../lib/dmtcp and ../bin, where MANA's scripts find
+# them.
+default: stage
+
+# ${WRAPPERS_SRCDIR}/libmpiwrappers.a made in stage/default before libmana.so
+# libmana.so needs libmpistub.so (in the same directory once installed): with
+# Open MPI, it refers to the MPI library's objects (see
+# generate-mpi-stub-objects.py), and a program that loads the MPI library
+# with dlopen() has not loaded libmpistub.so yet.
+libmana.so: ${LIBOBJS} ${WRAPPERS_SRCDIR}/libmpiwrappers.a
+	${CXX} -shared -fPIC -o $@ ${LIBOBJS} -Wl,--whole-archive ${WRAPPERS_SRCDIR}/libmpiwrappers.a -Wl,--no-whole-archive \
+	  -L${WRAPPERS_SRCDIR} -lmpistub -Wl,-rpath,'$$ORIGIN'
+
+# -MMD -MP writes the headers that an object includes into its .d file,
+# which make reads below.  So a change to a header rebuilds the objects
+# that include it.
+.c.o:
+	${MPICC} ${CFLAGS} -MMD -MP -c -o $@ $<
+
+.cpp.o:
+	${MPICXX} ${CXXFLAGS} -MMD -MP -c -o $@ $<
+
+# lower-half/Makefile builds switch-context.o, which the lower-half program
+# links too.
+lower-half/switch-context.o: FORCE
+	$(MAKE) -C ${LOWER_HALF_SRCDIR} switch-context.o
+
+-include $(wildcard *.d)
+
+${MANA_ROOT}/lib/dmtcp/libmana.so: libmana.so
+	cp -f $< $@
+${MANA_ROOT}/lib/dmtcp/libmpistub.so: ${WRAPPERS_SRCDIR}/mpi_stub_wrappers.txt \
+                                      ${WRAPPERS_SRCDIR}/mpi_stub_data.c
+	$(MAKE) -C ${WRAPPERS_SRCDIR} stage
+# Restage the audit module when its Makefile changes (see
+# mpi-wrappers/Makefile.in).
+${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so: \
+    ${WRAPPERS_SRCDIR}/mpi_stub_audit.c ${WRAPPERS_SRCDIR}/Makefile
+	$(MAKE) -C ${WRAPPERS_SRCDIR} stage
+
+# ${WRAPPERS_SRCDIR}/libmpiwrappers.a ia a prerequisite for libmana.so,
+#   which is a prerequisite for ${MANA_ROOT}/lib/dmtcp/libmana.so
+# Always do 'make' or 'make stage' -- not 'make libmana.so'
+stage:
+	$(MAKE) -C ${WRAPPERS_SRCDIR} libmpiwrappers.a libmpistub.so
+	$(MAKE) ${MANA_ROOT}/lib/dmtcp/libmana.so
+	$(MAKE) ${MANA_ROOT}/lib/dmtcp/libmpistub.so
+	$(MAKE) ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so
+	$(MAKE) -C ${LOWER_HALF_SRCDIR} stage
+	@ # CUDA-aware MPI (mana_launch --cuda): with a CUDA toolkit and driver.
+	if [ -n "$(HAVE_CUDA)" ]; then \
+	  $(MAKE) -C cuda-forward CUDA_HOME=$(CUDA_HOME) stage && \
+	  $(MAKE) -C ${DMTCP_ROOT}/plugin/cuda libdmtcp_cuda.so && \
+	  cp -f ${DMTCP_ROOT}/plugin/cuda/libdmtcp_cuda.so ${MANA_ROOT}/lib/dmtcp/; \
+	fi
+
+tidy:
+	rm -f *~ .*.swp dmtcp_restart_script*.sh ckpt_*.dmtcp
+	rm -rf ckpt_rank_*
+	rm -rf dmtcp_coordinator_db-*.json
+
+clean: tidy
+	- $(MAKE) -C cuda-forward clean
+	rm -f ${LIBOBJS} *.d
+	rm -f libmana.so
+	rm -f ${MANA_ROOT}/lib/dmtcp/libmana.so
+	cd ${LOWER_HALF_SRCDIR} && $(MAKE) clean
+	cd ${WRAPPERS_SRCDIR} && $(MAKE) clean
+
+distclean: clean
+
+FORCE:
+
+.PHONY: default clean distclean tidy stage
+
+# Regenerate this Makefile when Makefile.in or config.status is newer.
+Makefile: Makefile.in @top_builddir@/config.status
+	cd @top_builddir@ && ./config.status src/Makefile

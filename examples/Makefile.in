@@ -1,0 +1,21 @@
+# @configure_input@
+
+# Example MPI programs (see ring.c).  'make' builds them with the MPI
+# compiler that ./configure found, as for any MPI program.
+MPICC = @MPICC@
+
+EXAMPLES = ring
+
+default: ${EXAMPLES}
+
+${EXAMPLES}: %: %.c
+	${MPICC} -g -O2 -o $@ $<
+
+clean:
+	rm -f ${EXAMPLES}
+
+.PHONY: default clean
+
+# Regenerate this Makefile when Makefile.in or config.status is newer.
+Makefile: Makefile.in @top_builddir@/config.status
+	cd @top_builddir@ && ./config.status examples/Makefile

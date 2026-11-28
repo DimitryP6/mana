@@ -1,0 +1,709 @@
+/****************************************************************************
+ *   Copyright (C) 2019-2022 by Gene Cooperman, Illio Suardi, Rohan Garg,   *
+ *   Yao Xu                                                                 *
+ *   gene@ccs.neu.edu, illio@u.nus.edu, rohgarg@ccs.neu.edu,                *
+ *   xu.yao1@northeastern.edu                                               *
+ *                                                                          *
+ *  This file is part of DMTCP.                                             *
+ *                                                                          *
+ *  DMTCP is free software: you can redistribute it and/or                  *
+ *  modify it under the terms of the GNU Lesser General Public License as   *
+ *  published by the Free Software Foundation, either version 3 of the      *
+ *  License, or (at your option) any later version.                         *
+ *                                                                          *
+ *  DMTCP is distributed in the hope that it will be useful,                *
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           *
+ *  GNU Lesser General Public License for more details.                     *
+ *                                                                          *
+ *  You should have received a copy of the GNU Lesser General Public        *
+ *  License in the files COPYING and COPYING.LESSER.  If not, see           *
+ *  <http://www.gnu.org/licenses/>.                                         *
+ ****************************************************************************/
+
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
+
+#include <mpi.h>
+#include "mpi_plugin.h"
+#include "config.h"
+#include "dmtcp.h"
+#include "util.h"
+#include "dmtcp_assert.h"
+#include "lower_half_ckpt.h"
+#include "jfilesystem.h"
+#include "protectedfds.h"
+
+#include "mpi_nextfunc.h"
+#include "virtual_id.h"
+#include "seq_num.h"
+#include "p2p_drain.h"
+
+// TODO
+// - validate operation status (right now we assume them to be successful by
+//   default)
+// - immediately abort if comm == MPI_NULL_COMM in any of those cases
+
+// We implement our own data structure that bypasses the lower half for:
+// * MPI_Comm_create_keyval
+// * MPI_Comm_get_attr
+// * MPI_Comm_set_attr
+// * MPI_Comm_delete_attr
+// * MPI_Comm_free
+
+// The general workflow goes:
+// [create keyval] -> [get/set/delete attributes for keyval] -> [free keyval]
+// Attribute keys are locally unique in processes, and are used to associate
+// and access attributes on any locally defined communicator. This means that
+// multiple communicators can use the same attribute key for different
+// attributes. Thus, we use a structure like the following:
+// [keyval -> {[communicator -> attribute], extra_state, copy_fn, delete_fn}]
+struct KeyvalTuple {
+  KeyvalTuple () = default;
+
+  KeyvalTuple (void *extraState,
+           MPI_Comm_copy_attr_function *copyFn,
+           MPI_Comm_delete_attr_function *deleteFn,
+           std::unordered_map<MPI_Comm, void*> attributeMap)
+    : _extraState(extraState),
+      _copyFn(copyFn),
+      _deleteFn(deleteFn),
+      _attributeMap(attributeMap) {};
+  void *_extraState;
+  MPI_Comm_copy_attr_function *_copyFn;
+  MPI_Comm_delete_attr_function *_deleteFn;
+  std::unordered_map<MPI_Comm, void*> _attributeMap;
+  // The program freed the keyval, but an attribute still uses it.
+  bool _freed = false;
+};
+
+static std::vector<int> keyvalVec;
+static std::unordered_map<int, KeyvalTuple> tupleMap;
+// The keyvals of MPI_COMM_SELF's attributes, in the order in which the
+// program set the attributes.  See delete_self_attributes().
+static std::vector<int> selfKeyvals;
+
+// Removes a keyval that the program freed once no attribute uses it, and makes
+// its number free for MPI_Comm_create_keyval().  The standard keeps a freed
+// keyval until then, so that freeing a communicator still calls its delete
+// callback.
+static void
+remove_keyval_if_unused(int keyval)
+{
+  auto it = tupleMap.find(keyval);
+  if (it != tupleMap.end() && it->second._freed &&
+      it->second._attributeMap.empty()) {
+    tupleMap.erase(it);
+    keyvalVec[keyval] = -1;
+  }
+}
+
+// The lower half's MPI_TAG_UB at launch, copied because the lower half's
+// storage does not survive a restart.  See check_tag_ub().
+static int tag_ub;
+// The following are prvalues. So we need an address to point them to.
+// We're actually supposed to check the rank of the HOST process in the group
+// associated with the MPI_COMM_WORLD communicator, but even the standard says
+// "MPI does not specify what it means for a process to be a HOST, nor does it
+// require that a HOST exists". So we just use a no HOST value.
+static const int MPI_HOST_RANK = MPI_PROC_NULL;
+static const int MPI_IO_SOURCE = MPI_ANY_SOURCE;
+static const int MPI_WTIME_IS_GLOBAL_VAL = 0;
+// The lower half's MPI_APPNUM, MPI_UNIVERSE_SIZE and MPI_LASTUSEDCODE at
+// launch, and whether it has each one (the flag of MPI_Comm_get_attr()).
+// Like MPI_TAG_UB, they stay the launch ones after a restart.
+static int appnum;
+static int appnum_flag;
+static int universe_size;
+static int universe_size_flag;
+static int lastusedcode;
+static int lastusedcode_flag;
+
+// MPI attaches the bound to MPI_COMM_WORLD, so ask the lower half's world.
+static int
+lower_half_tag_ub()
+{
+  int *ub = NULL;
+  int flag = 0;
+  int retval;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_get_attr)(lh_info->MANA_COMM_WORLD, MPI_TAG_UB, &ub,
+                                    &flag);
+  RETURN_TO_UPPER_HALF();
+  ASSERT(retval == MPI_SUCCESS && flag, "retval={} flag={}", retval, flag);
+  return *ub;
+}
+
+void
+init_tag_ub()
+{
+  tag_ub = lower_half_tag_ub();
+}
+
+// The bound stays the launch one: the application, its messages in flight and
+// the logged receives may use any tag up to it, so a smaller bound cannot work.
+void
+check_tag_ub()
+{
+  int ub = lower_half_tag_ub();
+  if (ub < tag_ub) {
+    fprintf(stderr, "MANA: this MPI library allows tags up to %d (MPI_TAG_UB),"
+            " but the computation started with %d; it cannot restart here\n",
+            ub, tag_ub);
+    ASSERT(false, "MPI_TAG_UB is smaller than at launch: ub={} tag_ub={}", ub,
+           tag_ub);
+  }
+}
+
+// Copies the value of the lower half's attribute 'keyval' of MPI_COMM_WORLD
+// into *value, if the attribute exists, and sets *flag to whether it exists.
+static void
+copy_lower_half_attr(int keyval, int *value, int *flag)
+{
+  int *val = NULL;
+  int retval;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_get_attr)(lh_info->MANA_COMM_WORLD, keyval, &val,
+                                    flag);
+  RETURN_TO_UPPER_HALF();
+  ASSERT(retval == MPI_SUCCESS, "keyval={} retval={}", keyval, retval);
+  if (*flag) {
+    *value = *val;
+  }
+}
+
+void
+init_predefined_attributes()
+{
+  copy_lower_half_attr(MPI_APPNUM, &appnum, &appnum_flag);
+  copy_lower_half_attr(MPI_UNIVERSE_SIZE, &universe_size, &universe_size_flag);
+  copy_lower_half_attr(MPI_LASTUSEDCODE, &lastusedcode, &lastusedcode_flag);
+}
+
+// Gives newcomm, a duplicate of oldcomm, the attributes that the copy
+// callbacks of oldcomm's attributes return.  Returns the first error that a
+// callback returns.
+int
+copy_comm_attributes(MPI_Comm oldcomm, MPI_Comm newcomm)
+{
+  // A callback may create or free keyvals, which changes tupleMap.  So list
+  // the keyvals first, and look up each one again.
+  std::vector<int> keyvals;
+  for (auto &tuplePair : tupleMap) {
+    if (tuplePair.second._attributeMap.count(oldcomm) > 0) {
+      keyvals.push_back(tuplePair.first);
+    }
+  }
+  for (int keyval : keyvals) {
+    auto it = tupleMap.find(keyval);
+    if (it == tupleMap.end() || it->second._attributeMap.count(oldcomm) == 0) {
+      continue;
+    }
+    KeyvalTuple *tuple = &it->second;
+    if (tuple->_copyFn == MPI_COMM_NULL_COPY_FN) {
+      continue;
+    }
+    void *attribute_val = NULL;
+    int flag = 0;
+    int retval = tuple->_copyFn(oldcomm, keyval, tuple->_extraState,
+                                tuple->_attributeMap.at(oldcomm),
+                                &attribute_val, &flag);
+    if (retval != MPI_SUCCESS) {
+      return retval;
+    }
+    if (flag) {
+      tuple->_attributeMap.emplace(newcomm, attribute_val);
+    }
+  }
+  return MPI_SUCCESS;
+}
+
+// Deletes MPI_COMM_SELF's attributes in the reverse order in which the program
+// set them, as MPI_Finalize() must do first.  Libraries such as HDF5 clean up
+// in the delete callbacks.  Returns the first error of MPI_Comm_delete_attr().
+int
+delete_self_attributes()
+{
+  // A callback may set more attributes on MPI_COMM_SELF.
+  while (!selfKeyvals.empty()) {
+    int keyval = selfKeyvals.back();
+    selfKeyvals.pop_back();
+    int retval = MPI_Comm_delete_attr(MPI_COMM_SELF, keyval);
+    if (retval != MPI_SUCCESS) {
+      // The attribute stays.
+      selfKeyvals.push_back(keyval);
+      return retval;
+    }
+  }
+  return MPI_SUCCESS;
+}
+
+extern "C" {
+
+#pragma weak MPI_Comm_size = PMPI_Comm_size
+int PMPI_Comm_size(MPI_Comm comm, int *size)
+{
+  int retval = MPI_SUCCESS;
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_size)(real_comm, size);
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+#pragma weak MPI_Comm_rank = PMPI_Comm_rank
+int PMPI_Comm_rank(MPI_Comm comm, int *rank)
+{
+  int retval = MPI_SUCCESS;
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_rank)(real_comm, rank);
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+#pragma weak MPI_Comm_create = PMPI_Comm_create
+int PMPI_Comm_create(MPI_Comm comm, MPI_Group group, MPI_Comm *newcomm)
+{
+  int retval;
+  commit_begin(comm);
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  MPI_Group real_group = get_real_id((mana_mpi_handle){.group = group}).group;
+  uint64_t seed = child_gid_seed(comm);
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_create)(real_comm, real_group, newcomm);
+  RETURN_TO_UPPER_HALF();
+  if (retval == MPI_SUCCESS) {
+    if (*newcomm == lh_info->MANA_COMM_NULL) {
+      *newcomm = MPI_COMM_NULL;
+    } else {
+      *newcomm = new_virt_comm(*newcomm, seed);
+    }
+  }
+  LOWER_HALF_ENABLE_CKPT();
+  commit_finish(comm);
+  return retval;
+}
+
+#pragma weak MPI_Abort = PMPI_Abort
+int PMPI_Abort(MPI_Comm comm, int errorcode)
+{
+  int retval;
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Abort)(real_comm, errorcode);
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+#pragma weak MPI_Comm_compare = PMPI_Comm_compare
+int PMPI_Comm_compare(MPI_Comm comm1, MPI_Comm comm2, int *result)
+{
+  int retval;
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm1 = get_real_id((mana_mpi_handle){.comm = comm1}).comm;
+  MPI_Comm real_comm2 = get_real_id((mana_mpi_handle){.comm = comm2}).comm;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_compare)(real_comm1, real_comm2, result);
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+// TODO: Remove this function. It's only used in P2P draining. And we
+// already have solution to avoid using this function in P2P.
+int MPI_Comm_free_internal(MPI_Comm *comm)
+{
+  int retval;
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = *comm}).comm;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_free)(&real_comm);
+  RETURN_TO_UPPER_HALF();
+  return retval;
+}
+
+#pragma weak MPI_Comm_free = PMPI_Comm_free
+int PMPI_Comm_free(MPI_Comm *comm)
+{
+  // This bit of code is to execute the delete callback function when
+  // MPI_Comm_free is called. Typically we call this function for each
+  // attribute, but since our structure here is a bit different, we check, for
+  // each key value, if a communicator/attribute value pairing exists, and if
+  // it does then we call the callback function.
+  // A callback may create or free keyvals and delete attributes, which
+  // changes tupleMap.  So list the keyvals first, and look up each one again.
+  std::vector<int> keyvals;
+  for (auto &tuplePair : tupleMap) {
+    if (tuplePair.second._attributeMap.count(*comm) > 0) {
+      keyvals.push_back(tuplePair.first);
+    }
+  }
+  for (int keyval : keyvals) {
+    auto it = tupleMap.find(keyval);
+    if (it == tupleMap.end() || it->second._attributeMap.count(*comm) == 0) {
+      continue;
+    }
+    KeyvalTuple *tuple = &it->second;
+    std::unordered_map<MPI_Comm, void*> *attributeMap = &tuple->_attributeMap;
+    if (tuple->_deleteFn != MPI_COMM_NULL_DELETE_FN) {
+      int retval = tuple->_deleteFn(*comm,
+                                    keyval,
+                                    attributeMap->at(*comm),
+                                    tuple->_extraState);
+      // MPI_Comm_free fails, and the communicator keeps this attribute.
+      if (retval != MPI_SUCCESS) {
+        return retval;
+      }
+    }
+    attributeMap->erase(*comm);
+    remove_keyval_if_unused(keyval);
+  }
+  // MPI_Comm_free() is a collective call.
+  commit_begin(*comm);
+  LOWER_HALF_DISABLE_CKPT();
+  int retval;
+  if (lookup_virt_id_entry((mana_mpi_handle){.comm = *comm}) != NULL &&
+      get_comm_desc(*comm) != NULL) {
+    // The real free waits for the MPI_Comm_free barrier (see
+    // test_comm_free_barriers()).
+    MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = *comm}).comm;
+    retval = start_comm_free_barrier(get_comm_desc(*comm)->gid, real_comm);
+  } else {
+    // A predefined communicator or an invalid handle: the MPI library reports
+    // the error.
+    retval = MPI_Comm_free_internal(comm);
+  }
+  if (retval == MPI_SUCCESS) {
+    free_virt_id((mana_mpi_handle){.comm = *comm});
+    *comm = MPI_COMM_NULL;
+  }
+  LOWER_HALF_ENABLE_CKPT();
+  commit_finish(*comm);
+  return retval;
+}
+
+#pragma weak MPI_Comm_get_attr = PMPI_Comm_get_attr
+int PMPI_Comm_get_attr(MPI_Comm comm, int comm_keyval, void *attribute_val, int *flag)
+{
+  int retval = MPI_SUCCESS;
+  *flag = 0;
+  if (comm == MPI_COMM_NULL) {
+    return MPI_ERR_COMM;
+  }
+  // Environmental inquiries
+  switch (comm_keyval) {
+    case MPI_TAG_UB:
+      * (const int **) attribute_val = &tag_ub;
+      *flag = 1;
+      return retval;
+    case MPI_HOST:
+      * (const int **) attribute_val = &MPI_HOST_RANK;
+      *flag = 1;
+      return retval;
+    case MPI_IO:
+      * (const int **) attribute_val = &MPI_IO_SOURCE;
+      *flag = 1;
+      return retval;
+    case MPI_WTIME_IS_GLOBAL:
+      * (const int **) attribute_val = &MPI_WTIME_IS_GLOBAL_VAL;
+      *flag = 1;
+      return retval;
+    case MPI_APPNUM:
+      * (const int **) attribute_val = &appnum;
+      *flag = appnum_flag;
+      return retval;
+    case MPI_UNIVERSE_SIZE:
+      * (const int **) attribute_val = &universe_size;
+      *flag = universe_size_flag;
+      return retval;
+    case MPI_LASTUSEDCODE:
+      * (const int **) attribute_val = &lastusedcode;
+      *flag = lastusedcode_flag;
+      return retval;
+  }
+
+  // Regular queries
+  if (tupleMap.find(comm_keyval) == tupleMap.end()) {
+    return MPI_ERR_KEYVAL;
+  }
+  KeyvalTuple *tuple = &tupleMap.at(comm_keyval);
+  std::unordered_map<MPI_Comm, void*> *attributeMap = &tuple->_attributeMap;
+  if (attributeMap->find(comm) != attributeMap->end()) {
+    * (void **) attribute_val = attributeMap->at(comm);
+    * flag = 1;
+  }
+  return retval;
+}
+
+#pragma weak MPI_Comm_set_attr = PMPI_Comm_set_attr
+int PMPI_Comm_set_attr(MPI_Comm comm, int comm_keyval, void *attribute_val)
+{
+  int retval = MPI_SUCCESS;
+  if (comm == MPI_COMM_NULL) {
+    retval = MPI_ERR_COMM;
+    return retval;
+  }
+  if (tupleMap.find(comm_keyval) == tupleMap.end()) {
+    retval = MPI_ERR_KEYVAL;
+    return retval;
+  }
+  KeyvalTuple *tuple = &tupleMap.at(comm_keyval);
+  std::unordered_map<MPI_Comm, void*> *attributeMap = &tuple->_attributeMap;
+  if (attributeMap->find(comm) != attributeMap->end()) {
+    if (tuple->_deleteFn != MPI_COMM_NULL_DELETE_FN) {
+      retval = tuple->_deleteFn(comm,
+                                comm_keyval,
+                                attributeMap->at(comm),
+                                tuple->_extraState);
+      // MPI_Comm_set_attr fails, and the attribute keeps its old value.
+      if (retval != MPI_SUCCESS) {
+        return retval;
+      }
+    }
+    attributeMap->erase(comm);
+  } else if (comm == MPI_COMM_SELF) {
+    selfKeyvals.push_back(comm_keyval);
+  }
+  attributeMap->emplace(comm, attribute_val);
+  return retval;
+}
+
+#pragma weak MPI_Comm_delete_attr = PMPI_Comm_delete_attr
+int PMPI_Comm_delete_attr(MPI_Comm comm, int comm_keyval)
+{
+  int retval = MPI_SUCCESS;
+  if (comm == MPI_COMM_NULL) {
+    retval = MPI_ERR_COMM;
+    return retval;
+  }
+  if (tupleMap.find(comm_keyval) == tupleMap.end()) {
+    retval = MPI_ERR_KEYVAL;
+    return retval;
+  }
+  KeyvalTuple *tuple = &tupleMap.at(comm_keyval);
+  std::unordered_map<MPI_Comm, void*> *attributeMap = &tuple->_attributeMap;
+  if (attributeMap->find(comm) != attributeMap->end()) {
+    if (tuple->_deleteFn != MPI_COMM_NULL_DELETE_FN) {
+      retval = tuple->_deleteFn(comm,
+                                comm_keyval,
+                                attributeMap->at(comm),
+                                tuple->_extraState);
+      // MPI_Comm_delete_attr fails, and the attribute stays.
+      if (retval != MPI_SUCCESS) {
+        return retval;
+      }
+    }
+    attributeMap->erase(comm);
+    if (comm == MPI_COMM_SELF) {
+      selfKeyvals.erase(std::remove(selfKeyvals.begin(), selfKeyvals.end(),
+                                    comm_keyval),
+                        selfKeyvals.end());
+    }
+    remove_keyval_if_unused(comm_keyval);
+  }
+  return retval;
+}
+
+#pragma weak MPI_Comm_set_errhandler = PMPI_Comm_set_errhandler
+int PMPI_Comm_set_errhandler(MPI_Comm comm, MPI_Errhandler errhandler)
+{
+  int retval;
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  MPI_Errhandler real_errhandler = lower_half_handle(errhandler);
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_set_errhandler)(real_comm, real_errhandler);
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+#pragma weak MPI_Topo_test = PMPI_Topo_test
+int PMPI_Topo_test(MPI_Comm comm, int *status)
+{
+  int retval;
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Topo_test)(real_comm, status);
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+#pragma weak MPI_Comm_split_type = PMPI_Comm_split_type
+int PMPI_Comm_split_type(MPI_Comm comm, int split_type,
+                        int key, MPI_Info inf, MPI_Comm *newcomm)
+{
+  int retval;
+  commit_begin(comm);
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  MPI_Info real_info = lower_half_handle(inf);
+  uint64_t seed = child_gid_seed(comm);
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_split_type)(real_comm, split_type, key, real_info,
+                                      newcomm);
+  RETURN_TO_UPPER_HALF();
+  if (retval == MPI_SUCCESS) {
+    if (*newcomm == lh_info->MANA_COMM_NULL) {
+      *newcomm = MPI_COMM_NULL;
+    } else {
+      *newcomm = new_virt_comm(*newcomm, seed);
+    }
+  }
+  LOWER_HALF_ENABLE_CKPT();
+  commit_finish(comm);
+  return retval;
+}
+
+#pragma weak MPI_Attr_get = PMPI_Attr_get
+int PMPI_Attr_get(MPI_Comm comm, int keyval,
+                 void *attribute_val, int *flag)
+{
+  WARN(false,
+    "Use of MPI_Attr_get is deprecated - use MPI_Comm_get_attr instead");
+  // Keyvals and attributes live in the upper half; the lower half knows none.
+  return PMPI_Comm_get_attr(comm, keyval, attribute_val, flag);
+}
+
+#pragma weak MPI_Attr_delete = PMPI_Attr_delete
+int PMPI_Attr_delete(MPI_Comm comm, int keyval)
+{
+  WARN(false,
+    "Use of MPI_Attr_delete is deprecated - use MPI_Comm_delete_attr instead");
+  return PMPI_Comm_delete_attr(comm, keyval);
+}
+
+#pragma weak MPI_Attr_put = PMPI_Attr_put
+int PMPI_Attr_put(MPI_Comm comm, int keyval, void *attribute_val)
+{
+  WARN(false,
+    "Use of MPI_Attr_put is deprecated - use MPI_Comm_set_attr instead");
+  return PMPI_Comm_set_attr(comm, keyval, attribute_val);
+}
+
+// Whether 'keyval' is a predefined keyval of communicators, which MANA must
+// not hand out.  Open MPI numbers those from 0, like keyvalVec.
+static bool
+is_predefined_keyval(int keyval)
+{
+  return keyval == MPI_TAG_UB || keyval == MPI_HOST || keyval == MPI_IO ||
+         keyval == MPI_WTIME_IS_GLOBAL || keyval == MPI_APPNUM ||
+         keyval == MPI_LASTUSEDCODE || keyval == MPI_UNIVERSE_SIZE;
+}
+
+#pragma weak MPI_Comm_create_keyval = PMPI_Comm_create_keyval
+int PMPI_Comm_create_keyval(MPI_Comm_copy_attr_function *comm_copy_attr_fn,
+                       MPI_Comm_delete_attr_function *comm_delete_attr_fn,
+                       int *comm_keyval, void *extra_state)
+{
+  int retval = MPI_SUCCESS;
+  int keyval = 0;
+  for (; keyval < keyvalVec.size(); keyval++) {
+    if (keyvalVec[keyval] == -1) {
+      keyvalVec[keyval] = keyval;
+      *comm_keyval = keyvalVec[keyval];
+      tupleMap.emplace(keyval, KeyvalTuple(
+                       extra_state,
+                       comm_copy_attr_fn,
+                       comm_delete_attr_fn,
+                       std::unordered_map<MPI_Comm, void*>()));
+      return retval;
+    }
+  }
+  // Skip the predefined keyvals: their placeholders (-2) are never freed.
+  while (is_predefined_keyval(keyval)) {
+    keyvalVec.push_back(-2);
+    keyval++;
+  }
+  keyvalVec.push_back(keyval);
+  *comm_keyval = keyvalVec[keyval];
+  tupleMap.emplace(keyval, KeyvalTuple(
+                   extra_state,
+                   comm_copy_attr_fn,
+                   comm_delete_attr_fn,
+                   std::unordered_map<MPI_Comm, void*>()));
+  return retval;
+}
+
+#pragma weak MPI_Comm_free_keyval = PMPI_Comm_free_keyval
+int PMPI_Comm_free_keyval(int *comm_keyval)
+{
+  int retval = MPI_SUCCESS;
+  int keyval = *comm_keyval;
+  if (keyval < keyvalVec.size() && keyvalVec[keyval] >= 0 &&
+      !tupleMap.at(keyval)._freed) {
+    tupleMap.at(keyval)._freed = true;
+    remove_keyval_if_unused(keyval);
+    *comm_keyval = MPI_KEYVAL_INVALID;
+  } else {
+    WARN(false, "Attempted to free an invalid key: keyval={}", keyval);
+    retval = MPI_ERR_KEYVAL;
+  }
+  return retval;
+}
+
+// MPI-1's names of MPI_Comm_create_keyval() and MPI_Comm_free_keyval().
+#pragma weak MPI_Keyval_create = PMPI_Keyval_create
+int PMPI_Keyval_create(MPI_Copy_function *copy_fn,
+                       MPI_Delete_function *delete_fn,
+                       int *keyval, void *extra_state)
+{
+  return MPI_Comm_create_keyval(copy_fn, delete_fn, keyval, extra_state);
+}
+
+#pragma weak MPI_Keyval_free = PMPI_Keyval_free
+int PMPI_Keyval_free(int *keyval)
+{
+  return MPI_Comm_free_keyval(keyval);
+}
+
+#pragma weak MPI_Comm_create_group = PMPI_Comm_create_group
+int MPI_Comm_create_group_internal(MPI_Comm comm, MPI_Group group, int tag,
+                                   MPI_Comm *newcomm)
+{
+  int retval;
+  LOWER_HALF_DISABLE_CKPT();
+  MPI_Comm real_comm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
+  MPI_Group real_group = get_real_id((mana_mpi_handle){.group = group}).group;
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(Comm_create_group)(real_comm, real_group, tag, newcomm);
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
+int PMPI_Comm_create_group(MPI_Comm comm,
+                          MPI_Group group, int tag, MPI_Comm *newcomm)
+{
+  // Only the members of 'group' call this function.  So the clock of 'comm'
+  // must not count the call, and no clock shows that a member is in it.
+  // During a drain attempt, a member that has reached its targets waits here,
+  // even if another member is already in the call.  The attempt then fails.
+  // The member enters the call in the 1 s pause before the next attempt.
+  begin_critical_section(comm, false);
+  LOWER_HALF_DISABLE_CKPT();
+  uint64_t seed = group_child_gid_seed(comm, group, tag);
+  int retval = MPI_Comm_create_group_internal(comm, group, tag, newcomm);
+  if (retval == MPI_SUCCESS) {
+    if (*newcomm == lh_info->MANA_COMM_NULL) {
+      *newcomm = MPI_COMM_NULL;
+    } else {
+      *newcomm = new_virt_comm(*newcomm, seed);
+    }
+  }
+  LOWER_HALF_ENABLE_CKPT();
+  commit_finish(comm);
+  return retval;
+}
+
+} // end of: extern "C"
